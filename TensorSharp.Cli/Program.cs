@@ -911,10 +911,10 @@ namespace TensorSharp.Cli
 
             if (dumpPrompt)
             {
-                var dumpMessages = new List<ChatMessage>
-                {
-                    new ChatMessage { Role = "user", Content = rawText }
-                };
+                var dumpMessages = new List<ChatMessage>();
+                if (!string.IsNullOrEmpty(systemPrompt))
+                    dumpMessages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
+                dumpMessages.Add(new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths });
                 string rendered = PromptRenderer.Render(
                     model.Config.ChatTemplate, dumpMessages, addGenerationPrompt: true,
                     architecture: model.Config.Architecture, tools: tools, enableThinking: enableThinking);
@@ -964,7 +964,7 @@ namespace TensorSharp.Cli
                 _ = RunInference(model, rawText, imagePaths, warmupDecodeTokens, audioPaths,
                     isVideo: videoPath != null, samplingConfig: samplingConfig,
                     enableThinking: enableThinking, tools: tools, silent: true,
-                    preserveAllInput: pdfPath != null);
+                    preserveAllInput: pdfPath != null, systemPrompt: systemPrompt);
                 model.ResetKVCache();
                 model.ResetForwardTiming();
             }
@@ -973,7 +973,8 @@ namespace TensorSharp.Cli
                 isVideo: videoPath != null, samplingConfig: samplingConfig,
                 enableThinking: enableThinking, tools: tools,
                 preserveAllInput: pdfPath != null,
-                specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin);
+                specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
+                systemPrompt: systemPrompt);
 
             _log.LogInformation(LogEventIds.ChatCompleted,
                 "cli.inference.complete chars={Chars} preview=\"{Preview}\"",
@@ -1583,12 +1584,20 @@ namespace TensorSharp.Cli
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
             List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null,
             bool enableThinking = false, List<ToolFunction> tools = null, bool silent = false,
-            bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f)
+            bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f,
+            string systemPrompt = null)
         {
-            var messages = new List<ChatMessage>
+            var messages = new List<ChatMessage>();
+            // --system / --system-file applies to one-shot runs too, not just the
+            // interactive session. Models such as Shieldstral are specified with a
+            // fixed system message and misbehave without it.
+            if (!string.IsNullOrEmpty(systemPrompt))
+                messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
+            messages.Add(new ChatMessage
             {
-                new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo }
-            };
+                Role = "user", Content = rawText, ImagePaths = imagePaths,
+                AudioPaths = audioPaths, IsVideo = isVideo
+            });
 
             string rendered = PromptRenderer.Render(
                 model.Config.ChatTemplate, messages, addGenerationPrompt: true,

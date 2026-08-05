@@ -43,6 +43,7 @@ namespace TensorSharp.Models
 
         private string[][] _layerWeightNames;
         private float[] _ropeFreqs;
+        private float _ropeDecodeMscale = 1.0f;
         private int _ropeDim;
         private int _attnKeyLen;
         private int _attnValLen;
@@ -55,6 +56,8 @@ namespace TensorSharp.Models
         private float _ropeBetaSlow;
         private float _ropeMscale;
         private float _ropeMscaleAllDim;
+        private float _ropeAttnFactor;
+        private bool _yarnActive;
         private string _ropeType;
 
         // Vision support
@@ -84,7 +87,20 @@ namespace TensorSharp.Models
             _ropeBetaSlow = _gguf.GetFloat32($"{arch}.rope.scaling.yarn_beta_slow",
                             _gguf.GetFloat32($"{arch}.rope.scaling.beta_slow", 1.0f));
             _ropeMscale = _gguf.GetFloat32($"{arch}.rope.scaling.mscale", 0f);
-            _ropeMscaleAllDim = _gguf.GetFloat32($"{arch}.rope.scaling.mscale_all_dim", 0f);
+            // llama.cpp's converter stores YaRN's `mscale_all_dim` under the
+            // "yarn_log_multiplier" key (gguf_writer.add_rope_scaling_yarn_log_mul).
+            // Mistral-format checkpoints (Ministral 3 / Shieldstral) always write it:
+            // 1.0 when params.json has "apply_scale": false, 0.0 otherwise. Older
+            // GGUFs that spelled the key "mscale_all_dim" keep working via the fallback.
+            _ropeMscaleAllDim = _gguf.GetFloat32($"{arch}.rope.scaling.yarn_log_multiplier",
+                                _gguf.GetFloat32($"{arch}.rope.scaling.mscale_all_dim", 0f));
+            _ropeAttnFactor = _gguf.GetFloat32($"{arch}.rope.scaling.attn_factor", 1.0f);
+
+            // Single predicate for "YaRN is in effect", so the prefill kernel, the
+            // batched kernel and the hand-written decode kernel can never disagree
+            // about whether to apply the frequency ramp and the mscale correction.
+            _yarnActive = _ropeType == "yarn" && _ropeOrigCtx > 0
+                          && _ropeExtFactor != 0f && Config.RopeScale > 1.0f;
 
             Console.WriteLine($"Model: {arch}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                 $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, KeyLen={_attnKeyLen}, " +
@@ -227,45 +243,66 @@ namespace TensorSharp.Models
             for (int i = 0; i < halfDim; i++)
                 _ropeFreqs[i] = freqScale / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
 
-            if (_ropeType == "yarn" && _ropeOrigCtx > 0)
+            if (_yarnActive)
                 ApplyYarnFreqCorrection(_ropeFreqs, halfDim);
+
+            // The prefill path routes through Ops.RoPEEx, which folds the YaRN
+            // magnitude correction into cos/sin itself. The decode kernel below is
+            // hand-written, so it has to reproduce the same factor explicitly or the
+            // first decoded token would not line up with the prefilled prefix.
+            _ropeDecodeMscale = ComputeAttnFactor();
+            if (_yarnActive)
+                _ropeDecodeMscale *= 1.0f + 0.1f * MathF.Log(Config.RopeScale);
         }
 
         /// <summary>
-        /// Apply YaRN frequency correction to precomputed RoPE frequencies for decode path.
-        /// Interpolates between extrapolated and interpolated frequencies based on
-        /// whether each frequency band is within the "slow" or "fast" rotation range.
+        /// Apply YaRN frequency correction to the precomputed RoPE frequencies used by
+        /// the decode kernel, matching ggml's <c>rope_yarn</c> exactly: each frequency
+        /// band blends between the interpolated and extrapolated frequency with a ramp
+        /// that is linear in the *dimension index*, over the correction range derived
+        /// from beta_fast / beta_slow.
+        ///
+        /// This must stay bit-for-bit consistent with <see cref="Ops.RoPEEx"/> (used by
+        /// the prefill and batched paths) — a decode kernel that blended on a different
+        /// curve would rotate the newly generated token differently from the prompt
+        /// tokens already sitting in the KV cache.
         /// </summary>
         private void ApplyYarnFreqCorrection(float[] freqs, int halfDim)
         {
-            float lowFreqWavelen = (float)(_ropeOrigCtx / _ropeBetaSlow);
-            float highFreqWavelen = (float)(_ropeOrigCtx / _ropeBetaFast);
+            float freqScale = 1.0f / Config.RopeScale;
+            YarnCorrDims(_ropeDim, _ropeOrigCtx, Config.RopeBase, _ropeBetaFast, _ropeBetaSlow,
+                out float corrDimLow, out float corrDimHigh);
 
             for (int i = 0; i < halfDim; i++)
             {
-                float origFreq = 1.0f / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
-                float wavelen = 2.0f * MathF.PI / origFreq;
+                float thetaExtrap = 1.0f / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
+                float thetaInterp = freqScale * thetaExtrap;
 
-                if (wavelen < highFreqWavelen)
-                {
-                    // High frequency: use original frequency (extrapolation)
-                    freqs[i] = origFreq;
-                }
-                else if (wavelen > lowFreqWavelen)
-                {
-                    // Low frequency: use interpolated frequency
-                    freqs[i] = origFreq / Config.RopeScale;
-                }
-                else
-                {
-                    // Intermediate: smooth blend between interpolated and extrapolated
-                    float smooth = (lowFreqWavelen / wavelen - 1.0f) /
-                                   (lowFreqWavelen / highFreqWavelen - 1.0f);
-                    float interpFreq = origFreq / Config.RopeScale;
-                    freqs[i] = (1.0f - smooth) * interpFreq + smooth * origFreq;
-                }
+                float rampY = (i - corrDimLow) / MathF.Max(0.001f, corrDimHigh - corrDimLow);
+                float rampMix = (1.0f - Math.Clamp(rampY, 0.0f, 1.0f)) * _ropeExtFactor;
+
+                freqs[i] = thetaInterp * (1.0f - rampMix) + thetaExtrap * rampMix;
             }
         }
+
+        /// <summary>Mirror of ggml's <c>ggml_rope_yarn_corr_dims</c>.</summary>
+        private static void YarnCorrDims(int nDims, int nCtxOrig, float freqBase,
+            float betaFast, float betaSlow, out float low, out float high)
+        {
+            if (betaFast == 0.0f && betaSlow == 0.0f)
+            {
+                low = float.MaxValue;
+                high = nDims / 2 - 1;
+                return;
+            }
+
+            low = MathF.Max(0, MathF.Floor(YarnCorrDim(nDims, nCtxOrig, betaFast, freqBase)));
+            high = MathF.Min(nDims / 2 - 1, MathF.Ceiling(YarnCorrDim(nDims, nCtxOrig, betaSlow, freqBase)));
+        }
+
+        /// <summary>Mirror of ggml's <c>ggml_rope_yarn_corr_dim</c>.</summary>
+        private static float YarnCorrDim(int nDims, int nCtxOrig, float nRot, float freqBase)
+            => nDims * MathF.Log(nCtxOrig / (nRot * 2 * MathF.PI)) / (2 * MathF.Log(freqBase));
 
         private int _kvCacheCapacity;
 
@@ -792,11 +829,12 @@ namespace TensorSharp.Models
 
             float* cosTable = stackalloc float[halfDim];
             float* sinTable = stackalloc float[halfDim];
+            float mscale = _ropeDecodeMscale;
             for (int i = 0; i < halfDim; i++)
             {
                 float theta = position * _ropeFreqs[i];
-                cosTable[i] = MathF.Cos(theta);
-                sinTable[i] = MathF.Sin(theta);
+                cosTable[i] = MathF.Cos(theta) * mscale;
+                sinTable[i] = MathF.Sin(theta) * mscale;
             }
 
             for (int h = 0; h < numHeads; h++)
@@ -825,10 +863,10 @@ namespace TensorSharp.Models
             Tensor result = Ops.RoPEEx(
                 null, reshaped, posTensor, _ropeDim, 0, _ropeOrigCtx,
                 Config.RopeBase, 1.0f / Config.RopeScale,
-                _ropeType == "yarn" ? _ropeExtFactor : 0f,
+                _yarnActive ? _ropeExtFactor : 0f,
                 ComputeAttnFactor(),
-                _ropeType == "yarn" ? _ropeBetaFast : 0f,
-                _ropeType == "yarn" ? _ropeBetaSlow : 0f);
+                _yarnActive ? _ropeBetaFast : 0f,
+                _yarnActive ? _ropeBetaSlow : 0f);
 
             data.Dispose();
 
@@ -837,12 +875,45 @@ namespace TensorSharp.Models
             return flat;
         }
 
+        /// <summary>
+        /// YaRN attention factor, mirroring llama.cpp's llama_context setup.
+        ///
+        /// The RoPE kernel itself always folds in `1 + 0.1 * ln(factor)` when
+        /// ext_factor != 0, so the value returned here is the *correction* that
+        /// turns that fixed term into the model's actual magnitude scaling:
+        ///
+        ///   mscale(s, m)  = s &lt;= 1 ? 1 : 0.1 * m * ln(s) + 1
+        ///   attn_factor   = mscale(factor, mscale) / mscale(factor, mscale_all_dim)
+        ///                   / (1 + 0.1 * ln(factor))
+        ///
+        /// For Mistral-format checkpoints with "apply_scale": false — Ministral 3
+        /// and Shieldstral — mscale_all_dim is 1.0, so the two mscale terms cancel
+        /// and the net magnitude scaling is exactly 1.0 (i.e. no YaRN magnitude
+        /// boost), which is what the reference implementation does. When the GGUF
+        /// carries no log-multiplier at all, the ratio degenerates to
+        /// mscale(factor, 1) and the net scaling stays 1 + 0.1 * ln(factor).
+        /// </summary>
         private float ComputeAttnFactor()
         {
-            if (_ropeMscale != 0 && _ropeMscaleAllDim != 0)
-                return 1.0f / (0.1f * MathF.Log(Config.RopeScale) + 1.0f);
-            return 1.0f;
+            if (!_yarnActive)
+                return _ropeAttnFactor;
+
+            float factor = Config.RopeScale;
+
+            // llama.cpp assumes mscale == 1.0 unless the GGUF states otherwise.
+            float mscale = _ropeMscale != 0f ? _ropeMscale : 1.0f;
+            float attnFactor = _ropeMscaleAllDim != 0f
+                ? YarnMscale(factor, mscale) / YarnMscale(factor, _ropeMscaleAllDim)
+                : YarnMscale(factor, 1.0f);
+
+            // Cancel the `1 + 0.1 * ln(factor)` the RoPE kernel applies internally.
+            attnFactor /= 1.0f + 0.1f * MathF.Log(factor);
+
+            return attnFactor * _ropeAttnFactor;
         }
+
+        private static float YarnMscale(float scale, float mscale)
+            => scale <= 1.0f ? 1.0f : 0.1f * mscale * MathF.Log(scale) + 1.0f;
 
         /// <summary>
         /// Position-dependent Q scaling for YaRN:

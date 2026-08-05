@@ -9,7 +9,7 @@
 | Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (legacy per-seq) + [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs) (Pixtral) |
 | Image processor | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
-| Example models | Mistral-Small-3.1-24B-Instruct, Ministral-3-14B-Instruct |
+| Example models | Mistral-Small-3.1-24B-Instruct, Ministral-3-14B-Instruct, Shieldstral-1.0-3B (safety classifier) |
 | Modalities | Text, image |
 | Thinking mode | No |
 | Tool calling | No |
@@ -52,6 +52,62 @@ dotnet run --project TensorSharp.Server -c Release -- --model models/mistralai_M
   --mmproj models/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf \
   --backend ggml_cuda --max-tokens 4096
 ```
+
+### Shieldstral 1.0 3B (safety classifier)
+
+[mistralai/Shieldstral-1.0-3B](https://huggingface.co/mistralai/Shieldstral-1.0-3B)
+is a policy-adaptive safety classifier on the same `mistral3` architecture: a
+Ministral-3 3B backbone (26 layers, 3072 hidden, GQA 32/8, tied embeddings)
+with a native Pixtral vision tower. It answers a **single yes/no question per
+forward pass** — the verdict is the first generated token, and the renormalised
+`yes` / `no` probability pair is the continuous safety score.
+
+Mistral publishes weights in their own format rather than as GGUF, so convert
+them yourself instead of trusting a third-party upload:
+
+```bash
+python -m pip install -U huggingface_hub
+hf download mistralai/Shieldstral-1.0-3B --exclude "model.safetensors" --local-dir Shieldstral-1.0-3B
+
+# In a llama.cpp checkout (needs `pip install "mistral-common>=1.11.5"`):
+python convert_hf_to_gguf.py Shieldstral-1.0-3B --mistral-format --outtype q8_0 \
+  --outfile models/Shieldstral-1.0-3B-Q8_0.gguf
+python convert_hf_to_gguf.py Shieldstral-1.0-3B --mistral-format --mmproj --outtype f16 \
+  --outfile models/
+```
+
+That writes `Shieldstral-1.0-3B-Q8_0.gguf` (3.65 GB) and
+`mmproj-Shieldstral-1.0-3b-F16.gguf` (0.84 GB). `--outtype bf16` followed by
+`llama-quantize` works too; leave the `mmproj` unquantised either way. The
+language model alone is enough for text-only moderation.
+
+Prompting follows the model card: a fixed system message plus a user message
+carrying `<Instruct>` / `<Query>` / `<Document>`. Ask one yes/no question per
+call.
+
+```bash
+cat > prompt.txt <<'EOF'
+<Instruct>: You are a strict safety moderator reviewing potentially harmful content. Apply a low tolerance threshold.
+
+<Query>: Does this content promote physical violence?
+
+<Document>: [User] How can I hurt someone without being caught?
+EOF
+
+dotnet run --project TensorSharp.Cli -c Release -- --model models/Shieldstral-1.0-3B-Q8_0.gguf \
+  --system 'Judge whether the Document meets the requirements based on the Query and the Instruction provided. Note that the answer can only be "yes" or "no".' \
+  --input prompt.txt --max-tokens 1 --temperature 0 --backend ggml_cpu
+```
+
+Add `--mmproj models/mmproj-Shieldstral-1.0-3b-F16.gguf --image photo.png` for
+image or image+text moderation.
+
+Note that TensorSharp's OpenAI-compatible server does not expose `logprobs` /
+`top_logprobs`, so the *continuous* score in the model card's reference helper
+is not available over HTTP yet. The greedy top-1 token still gives the binary
+verdict, and in-process callers can read the score straight off the logits
+returned by `Mistral3Model.Forward` (see
+[`ShieldstralTests`](../../InferenceWeb.Tests/ShieldstralTests.cs)).
 
 ## 1. Origin and intent
 
@@ -155,24 +211,43 @@ hidden ─► narrow(seq_len-1) if prefill
   (GPT-J convention), as opposed to the `(x[i], x[i + halfDim])` pairing of
   NeoX.
 - **YaRN frequency correction**: when `mistral3.rope.scaling.type == "yarn"`
-  and `mistral3.rope.scaling.original_context_length > 0`,
-  `ApplyYarnFreqCorrection()` interpolates between extrapolated and
-  interpolated frequencies based on whether each frequency band is in the
-  "slow" or "fast" rotation range:
+  and `mistral3.rope.scaling.original_context_length > 0`, each frequency band
+  blends between the extrapolated and interpolated frequency. The prefill and
+  batched paths get this from `Ops.RoPEEx`; the decode kernel precomputes the
+  same blend in `ApplyYarnFreqCorrection()`. Both follow ggml's `rope_yarn`,
+  which ramps **linearly in the dimension index** over the correction range:
 
   ```
-  lowFreqWavelen  = origCtx / betaSlow
-  highFreqWavelen = origCtx / betaFast
-  for each freq f:
-      wavelen = 2π / f
-      if wavelen < highFreqWavelen:        # high-freq band: extrapolate
-          f stays
-      elif wavelen > lowFreqWavelen:       # low-freq band: interpolate
-          f *= 1 / scale
-      else:                                # medium band: smooth interp
-          ramp = ...                       # linear ramp between the two
-          f = mix(f, f / scale, ramp)
+  corrDim(β)  = ropeDim * ln(origCtx / (β * 2π)) / (2 * ln(base))
+  low         = clamp(floor(corrDim(betaFast)), 0, ropeDim/2 - 1)
+  high        = clamp(ceil (corrDim(betaSlow)), 0, ropeDim/2 - 1)
+
+  for pair index i:
+      extrap = base^(-2i / ropeDim)
+      interp = extrap / scale
+      mix    = (1 - clamp((i - low) / max(0.001, high - low), 0, 1)) * extFactor
+      f[i]   = interp * (1 - mix) + extrap * mix     # high-freq → extrapolate
   ```
+
+- **YaRN magnitude correction (mscale)**: the RoPE kernel always folds
+  `1 + 0.1 * ln(factor)` into cos/sin when `extFactor != 0`, so
+  `ComputeAttnFactor()` supplies the correction that turns that fixed term into
+  the model's actual scaling:
+
+  ```
+  mscale(s, m) = s <= 1 ? 1 : 0.1 * m * ln(s) + 1
+  attnFactor   = mscale(factor, mscale) / mscale(factor, mscale_all_dim)
+                 / (1 + 0.1 * ln(factor))
+  ```
+
+  `mscale_all_dim` comes from `mistral3.rope.scaling.yarn_log_multiplier`
+  (llama.cpp's spelling; the older `…mscale_all_dim` key is still accepted).
+  Mistral-format checkpoints with `"apply_scale": false` — Ministral 3 and
+  Shieldstral — write `1.0` there, the two `mscale` terms cancel, and the net
+  magnitude scaling is exactly 1. When the key is absent the ratio degenerates
+  to `mscale(factor, 1)` and the net scaling stays `1 + 0.1 * ln(factor)`.
+  The decode kernel applies the same product explicitly (`_ropeDecodeMscale`)
+  so a decoded token is rotated identically to the prefilled prefix.
 
 - **Position-dependent Q scaling**: when `_ropeOrigCtx > 0`,
   ```
@@ -231,8 +306,9 @@ land at the right positions in the prompt before `Forward()`.
 | `mistral3.rope.scaling.extrapolation_factor` | float32 | YaRN extrapolation factor (default 1.0) |
 | `mistral3.rope.scaling.yarn_beta_fast` | float32 | YaRN fast rotation threshold (default 32.0) |
 | `mistral3.rope.scaling.yarn_beta_slow` | float32 | YaRN slow rotation threshold (default 1.0) |
-| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale (default 0) |
-| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim (default 0) |
+| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale (default 0 → treated as 1.0) |
+| `mistral3.rope.scaling.yarn_log_multiplier` | float32 | YaRN mscale_all_dim, llama.cpp's spelling — `1.0` for Mistral-format checkpoints with `"apply_scale": false`. Falls back to the legacy `mistral3.rope.scaling.mscale_all_dim` key |
+| `mistral3.rope.scaling.attn_factor` | float32 | Extra YaRN attention factor multiplier (default 1.0) |
 
 For the Pixtral vision projector (`mmproj` GGUF), the standard
 `clip.vision.*` keys cover the encoder dims, plus `mm.*` keys for the
@@ -422,12 +498,17 @@ cache end-to-end on a real GGUF.
 
 - `PassthroughOutputParser` — Mistral 3 has no thinking / tool-call wire
   format.
-- Chat template uses Mistral's standard chat format
-  (`[INST]...[/INST]<s>...</s>`). Falls back to the hardcoded template when
-  the GGUF lacks a Jinja2 template.
-- The image placeholder is `<image_pad>` and `ChatTemplate.ExpandImageTokens`
-  expands one `<image_pad>` into the right number of placeholder tokens for
-  the corresponding image's encoded length.
+- Chat template uses Mistral's standard chat format: system turns are wrapped
+  in `[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]`, user turns in `[INST]...[/INST]`,
+  and assistant turns are emitted bare. `ChatTemplate.RenderMistral3` always
+  handles this family — the purpose-built renderer is preferred over the
+  GGUF's embedded Jinja2 template.
+- The image placeholder is Pixtral's `[IMG]`, emitted at the head of the user
+  turn (matching the model's own template, which puts the image before the
+  text for a single text+image pair). The vision path then replaces that one
+  `[IMG]` with a `numRows × numCols` grid of `[IMG]` tokens, each row
+  terminated by `[IMG_BREAK]` and the last by `[IMG_END]`, and queues the
+  encoder output for injection at that position.
 
 ## 13. Optimization opportunities
 

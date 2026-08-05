@@ -116,7 +116,7 @@ public static class ModelDiscovery
         {
             "gemma4" => new[] { "gemma-4-mmproj", "gemma4-mmproj", "mmproj" },
             "gemma3" => new[] { "gemma-3-mmproj", "gemma3-mmproj", "mmproj" },
-            "mistral3" => new[] { "ministral", "mistral", "mmproj" },
+            "mistral3" => new[] { "shieldstral", "ministral", "mistral", "mmproj" },
             "qwen35" or "qwen36" => new[] { "qwen", "mmproj" },
             "nemotron" => new[] { "nemotron", "mmproj" },
             _ => new[] { "mmproj" },
@@ -185,8 +185,9 @@ public static class ModelDiscovery
                 SupportsImage: omni, SupportsAudio: false, SupportsVideo: false,
                 SupportsTools: true, SupportsThinking: true);
         }
-        // Mistral 3 / Ministral
-        if (lower.Contains("ministral") || lower.Contains("mistral-small-3") || lower.Contains("mistral3"))
+        // Mistral 3 / Ministral / Shieldstral (Ministral 3 backbone + Pixtral vision)
+        if (lower.Contains("ministral") || lower.Contains("mistral-small-3") || lower.Contains("mistral3")
+            || lower.Contains("shieldstral"))
         {
             return new FamilyGuess(baseName.ToLowerInvariant(), "mistral3", baseName,
                 SupportsImage: true, SupportsAudio: false, SupportsVideo: false,

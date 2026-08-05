@@ -269,10 +269,10 @@ namespace TensorSharp.Models
             Tensor result = Ops.RoPEEx(
                 null, reshaped, positionsTensor, _ropeDim, 0, _ropeOrigCtx,
                 Config.RopeBase, 1.0f / Config.RopeScale,
-                _ropeType == "yarn" ? _ropeExtFactor : 0f,
+                _yarnActive ? _ropeExtFactor : 0f,
                 ComputeAttnFactor(),
-                _ropeType == "yarn" ? _ropeBetaFast : 0f,
-                _ropeType == "yarn" ? _ropeBetaSlow : 0f);
+                _yarnActive ? _ropeBetaFast : 0f,
+                _yarnActive ? _ropeBetaSlow : 0f);
             data.Dispose();
             Tensor flat = result.View(numTokens, numHeads * headDim);
             result.Dispose();

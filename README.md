@@ -176,7 +176,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5/3.6-35B-A3B (MoE) | Image | Yes | Yes | Yes on Qwen 3.6 (embedded NextN) | [qwen35.md](docs/models/qwen35.md) |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | Yes | — | [gptoss.md](docs/models/gptoss.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B/47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni | Image (Omni) | Yes | Yes | — | [nemotron.md](docs/models/nemotron.md) |
-| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | — | [mistral3.md](docs/models/mistral3.md) |
+| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct, Ministral 3, Shieldstral-1.0-3B (safety classifier) | Image | No | No | — | [mistral3.md](docs/models/mistral3.md) |
 | DiffusionGemma | `diffusion-gemma` | diffusion-gemma text-diffusion GGUFs | Text only | No | No | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
 | Qwen-Image-Edit | `qwen_image` | qwen-image-edit MMDiT GGUFs (+ VAE & Qwen2.5-VL) | Image edit (image+text → image) | No | No | — | [qwenimage.md](docs/models/qwenimage.md) |
 

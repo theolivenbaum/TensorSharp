@@ -52,6 +52,38 @@ namespace TensorSharp.Models
         public int SpatialMergeSize => _spatialMergeSize;
         public int ImageSize => _imageSize;
 
+        /// <summary>
+        /// Resolve a mmproj tensor name, preferring the canonical GGUF spelling
+        /// that llama.cpp's converter emits and falling back to the Mistral/HF
+        /// source spelling.
+        ///
+        /// llama.cpp maps the upstream Pixtral checkpoint names onto its own
+        /// vocabulary when it writes the mmproj (see gguf-py/gguf/tensor_mapping.py):
+        /// <c>patch_conv</c> → <c>v.patch_embd</c>, the encoder's pre-norm →
+        /// <c>v.pre_ln</c>, per-block <c>attn_norm</c>/<c>ffn_norm</c> →
+        /// <c>ln1</c>/<c>ln2</c>, and the projector's
+        /// <c>patch_merger.merging_layer</c> / <c>linear_1</c> / <c>linear_2</c> →
+        /// <c>mm.patch_merger</c> / <c>mm.1</c> / <c>mm.2</c>. Keeping both
+        /// spellings lets an mmproj produced by either naming scheme load.
+        /// </summary>
+        private string ResolveWeight(string preferred, string legacy)
+            => _weights.ContainsKey(preferred) ? preferred : legacy;
+
+        private string PatchEmbedName => ResolveWeight("v.patch_embd.weight", "v.patch_conv.weight");
+        private string PatchEmbedBiasName => ResolveWeight("v.patch_embd.bias", "v.patch_conv.bias");
+        private string PreNormName => ResolveWeight("v.pre_ln.weight", "v.encoder_norm.weight");
+        private string MmInputNormName => ResolveWeight("mm.input_norm.weight", "mm.norm.weight");
+        private string MmPatchMergerName
+            => ResolveWeight("mm.patch_merger.weight", "mm.patch_merger.merging_layer.weight");
+        private string MmLinear1Name => ResolveWeight("mm.1.weight", "mm.linear_1.weight");
+        private string MmLinear2Name => ResolveWeight("mm.2.weight", "mm.linear_2.weight");
+        private string BlockAttnNormName(int blockIdx)
+            => ResolveWeight($"v.blk.{blockIdx}.ln1.weight", $"v.blk.{blockIdx}.attn_norm.weight");
+        private string BlockFfnNormName(int blockIdx)
+            => ResolveWeight($"v.blk.{blockIdx}.ln2.weight", $"v.blk.{blockIdx}.ffn_norm.weight");
+        private string BlockAttnOutName(string prefix)
+            => ResolveWeight($"{prefix}.attn_out.weight", $"{prefix}.attn_output.weight");
+
         public Mistral3VisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
@@ -147,7 +179,7 @@ namespace TensorSharp.Models
             var hidden = PatchEmbed(pixelValues, imageWidth, imageHeight, numPatchesW, numPatchesH);
 
             // Encoder norm
-            using var normed = RMSNormOp(hidden, "v.encoder_norm.weight");
+            using var normed = RMSNormOp(hidden, PreNormName);
             hidden.Dispose();
             hidden = Ops.NewContiguous(normed);
 
@@ -181,10 +213,10 @@ namespace TensorSharp.Models
             var result = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
             float* dst = GetFloatPtr(result);
 
-            var convWeight = _weights["v.patch_conv.weight"];
+            var convWeight = _weights[PatchEmbedName];
             float* wPtr = GetFloatPtr(convWeight);
-            float* biasPtr = _weights.ContainsKey("v.patch_conv.bias")
-                ? GetFloatPtr(_weights["v.patch_conv.bias"]) : null;
+            float* biasPtr = _weights.TryGetValue(PatchEmbedBiasName, out var convBias)
+                ? GetFloatPtr(convBias) : null;
 
             int C = 3;
             int P = _patchSize;
@@ -290,13 +322,13 @@ namespace TensorSharp.Models
         {
             string prefix = $"v.blk.{blockIdx}";
 
-            using var normed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
+            using var normed = RMSNormOp(hidden, BlockAttnNormName(blockIdx));
             using var attnOut = VisionSelfAttention(normed, prefix, numPatches, cos, sin);
 
             Ops.Add(attnOut, attnOut, hidden);
             hidden.Dispose();
 
-            using var normed2 = RMSNormOp(attnOut, $"{prefix}.ffn_norm.weight");
+            using var normed2 = RMSNormOp(attnOut, BlockFfnNormName(blockIdx));
             using var mlpOut = VisionMLP(normed2, prefix);
 
             var result = new Tensor(_allocator, DType.Float32, attnOut.Sizes);
@@ -332,7 +364,7 @@ namespace TensorSharp.Models
                 qRoped.Dispose();
                 kRoped.Dispose();
                 using var flat = attn4.View(numPatches, _hiddenSize);
-                return LinearForward(flat, $"{prefix}.attn_output.weight");
+                return LinearForward(flat, BlockAttnOutName(prefix));
             }
 
             // Manual attention path
@@ -359,7 +391,7 @@ namespace TensorSharp.Models
             using var flatContig = contiguous.View(numPatches, _hiddenSize);
             attnOutput.Dispose();
 
-            return LinearForward(flatContig, $"{prefix}.attn_output.weight");
+            return LinearForward(flatContig, BlockAttnOutName(prefix));
         }
 
         /// <summary>
@@ -418,7 +450,7 @@ namespace TensorSharp.Models
             int numPatches = patchesW * patchesH;
 
             // RMSNorm
-            using var normed = RMSNormOp(visionOutput, "mm.norm.weight");
+            using var normed = RMSNormOp(visionOutput, MmInputNormName);
 
             // Patch merger: merge spatialMergeSize x spatialMergeSize patches
             int mergedW = patchesW / _spatialMergeSize;
@@ -456,13 +488,13 @@ namespace TensorSharp.Models
             }
 
             // Patch merger linear
-            using var merged = LinearForward(mergeInput, "mm.patch_merger.merging_layer.weight");
+            using var merged = LinearForward(mergeInput, MmPatchMergerName);
             mergeInput.Dispose();
 
             // Linear1 → GELU → Linear2
-            using var proj1 = LinearForward(merged, "mm.linear_1.weight");
+            using var proj1 = LinearForward(merged, MmLinear1Name);
             Ops.GELU(proj1, proj1);
-            var proj2 = LinearForward(proj1, "mm.linear_2.weight");
+            var proj2 = LinearForward(proj1, MmLinear2Name);
 
             Console.WriteLine($"Vision projector: {numPatches} patches → {mergedPatches} merged tokens " +
                 $"({(int)proj2.Sizes[0]}x{(int)proj2.Sizes[1]})");
@@ -479,8 +511,15 @@ namespace TensorSharp.Models
 
         private Tensor LinearForward(Tensor input, string weightName)
         {
+            // Every projection this encoder asks for is mandatory. Returning null
+            // for a missing one only defers the failure to an opaque
+            // ArgumentNullException several ops later, which is exactly how an
+            // mmproj tensor-naming mismatch used to present itself.
             if (!_weights.ContainsKey(weightName))
-                return null;
+                throw new KeyNotFoundException(
+                    $"Mistral 3 vision encoder: mmproj is missing '{weightName}'. " +
+                    "The projector was probably produced by a converter using different " +
+                    "tensor names than this build understands.");
 
             var weight = _weights[weightName];
             int seqLen = (int)input.Sizes[0];
