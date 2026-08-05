@@ -993,6 +993,12 @@ namespace TensorSharp.Runtime
         /// Render Mistral 3 chat template.
         /// Uses [SYSTEM_PROMPT]...[/SYSTEM_PROMPT] for system messages
         /// and [INST]...[/INST] for user messages.
+        ///
+        /// Images are emitted as the Pixtral [IMG] placeholder at the head of the
+        /// user turn, matching the model's own template, which reorders a single
+        /// (text, image) pair so the image comes first. The [IMG] marker is what
+        /// the vision path scans for when it splices patch embeddings into the
+        /// token stream, so it has to be in the rendered prompt.
         /// </summary>
         public static string RenderMistral3(List<ChatMessage> messages, bool addGenerationPrompt = true)
         {
@@ -1013,6 +1019,11 @@ namespace TensorSharp.Runtime
                 if (msg.Role == "user")
                 {
                     sb.Append("[INST]");
+                    if (msg.ImagePaths != null)
+                    {
+                        for (int img = 0; img < msg.ImagePaths.Count; img++)
+                            sb.Append("[IMG]");
+                    }
                     sb.Append(msg.Content);
                     sb.Append("[/INST]");
                 }

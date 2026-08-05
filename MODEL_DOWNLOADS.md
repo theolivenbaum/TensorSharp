@@ -24,6 +24,7 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron 3 Nano Omni 30B-A3B (image-capable) | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) — mmproj `mmproj-BF16.gguf` (same repo) is required for image input. Audio is preprocessed only: real audio inference needs a Parakeet audio mmproj these GGUFs do not ship |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) — Pixtral mmproj `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` in the same repo |
+| Mistral 3 | Shieldstral-1.0-3B (safety classifier) | [mistralai/Shieldstral-1.0-3B](https://huggingface.co/mistralai/Shieldstral-1.0-3B) — Mistral publishes no GGUF; convert the official weights yourself with llama.cpp's `convert_hf_to_gguf.py --mistral-format` (see [Shieldstral](#shieldstral-10-3b--safety-classifier) below) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731 (284B MoE) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) — one subdirectory per quant (`UD-Q8_K_XL/`, `UD-IQ4_XS/`, `UD-IQ1_S/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. Text only |
 | DeepSeek V4 | DSpark speculative drafters | see [DSpark drafters](#dspark-drafters) below — a separate GGUF loaded with `--draft-model` for ~1.3-1.4x decode |
 | DiffusionGemma | diffusiongemma-26B-A4B-it | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) (`general.architecture` = `diffusion-gemma`) |
@@ -180,6 +181,27 @@ hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mmproj-
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf --mmproj models/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --input prompt.txt --max-tokens 300 --backend ggml_cuda
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf --mmproj models/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --backend ggml_cuda
 ```
+
+**Shieldstral 1.0 3B** — safety classifier, text + image ([mistralai/Shieldstral-1.0-3B](https://huggingface.co/mistralai/Shieldstral-1.0-3B))
+
+Mistral ships this one in their own format, not as GGUF, so convert the
+official weights rather than picking up a third-party upload:
+
+```bash
+hf download mistralai/Shieldstral-1.0-3B --exclude "model.safetensors" --local-dir Shieldstral-1.0-3B
+
+# In a llama.cpp checkout; needs pip install "mistral-common>=1.11.5"
+python convert_hf_to_gguf.py Shieldstral-1.0-3B --mistral-format --outtype q8_0 --outfile models/Shieldstral-1.0-3B-Q8_0.gguf
+python convert_hf_to_gguf.py Shieldstral-1.0-3B --mistral-format --mmproj --outtype f16 --outfile models/
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Shieldstral-1.0-3B-Q8_0.gguf --system 'Judge whether the Document meets the requirements based on the Query and the Instruction provided. Note that the answer can only be "yes" or "no".' --input prompt.txt --max-tokens 1 --temperature 0 --backend ggml_cuda
+```
+
+Shieldstral emits a single `yes` / `no` verdict token per forward pass, so
+`--max-tokens 1`. Put `<Instruct>` / `<Query>` / `<Document>` in `prompt.txt`
+as the model card describes, and add `--mmproj models/mmproj-Shieldstral-1.0-3b-F16.gguf --image photo.png`
+for image moderation. See [docs/models/mistral3.md](docs/models/mistral3.md#shieldstral-10-3b-safety-classifier)
+for the full recipe.
 
 **DiffusionGemma** — block text-diffusion ([unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF))
 
