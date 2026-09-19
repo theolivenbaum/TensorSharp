@@ -239,7 +239,7 @@ other unchanged:
 | field | type | meaning |
 |---|---|---|
 | `diffusion_seed_canvas` | `int[]`, exactly the canvas width | replaces the random initial canvas after prefill |
-| `diffusion_canvas_length` | `int` | the leading canvas positions this request owns (default: the served canvas) |
+| `diffusion_canvas_length` | `int` | the canvas this request denoises, at most the served canvas (default: the served canvas). The forward runs at this width |
 | `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
 | `diffusion_read_only` | `bool` | emit the argmax canvas at the cap, end the request there, and report temperature-1 logprobs at every position |
 
@@ -262,10 +262,16 @@ top-K is taken at the step's temperature). That is one readback per step, over
 the handful of steps a read runs. The top-K sweep itself runs once per read,
 on the step that emits.
 
-Note one difference from vLLM: TensorSharp's canvas forward is fixed-width, so
-`diffusion_canvas_length` narrows what the request *owns* rather than what is
-computed. Positions past the width are re-noised every step - they never settle
-and are never emitted - but they cost the same as a full canvas.
+`diffusion_canvas_length` narrows the forward itself. Attention, the MoE and
+the lm_head all scale with the canvas width, so a request that knows its answer
+is short pays for its own canvas rather than the served one - and the emitted
+canvas, the logprobs and the readback all shrink with it.
+
+This is not only a cost knob. A 32-wide canvas is a 32-token block, not a
+256-token block with 224 positions ignored: the model sees a shorter block than
+the one it was trained on, and the answer can move. Narrow when the answer's
+length is known - a templated read - and measure the accuracy, not only the
+throughput. Free-text generation leaves it alone.
 
 ### In-process
 
@@ -354,8 +360,12 @@ Two read fields exist for it, on top of the structured-read contract above:
 
 Where open-jev applies a `[canvas, vocab]` logits mask each step, TensorSharp
 pins positions: the same effect where it matters, without materializing the
-mask. Questions on one canvas share attention, and a question set too large for
-one canvas is split and merged - so this does not isolate questions from one
+mask. open-jev always denoises the model's full 256-token canvas, padded with
+end-of-sequence tokens; `StructuredPredictOptions.CanvasFit = Tight` instead
+compiles the canvas to the width the answers need and runs the forward there.
+
+Questions on one canvas share attention, and a question set too large for one
+canvas is split and merged - so this does not isolate questions from one
 another.
 
 ## 7. Test coverage
@@ -373,7 +383,10 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
   read's equivalence between the single-request and batched paths, and the
   per-request step cap in a batch with a longer generation.
 - Typed JSON decisions: pinned positions holding through a multi-step denoise,
-  a prediction in its allowed language, and a benchmark receipt.
+  a prediction in its allowed language, a tight canvas answering for less, and
+  a benchmark receipt.
+- A narrow canvas costing less than the served one, which is the whole point of
+  a per-request width.
 
 [`DiffusionStructuredReadTests`](../../InferenceWeb.Tests/DiffusionStructuredReadTests.cs)
 needs no checkpoint and runs in ordinary CI: what a read is allowed to ask for
@@ -390,8 +403,9 @@ on their own terms.
 
 - Add dedicated API examples once Ollama/OpenAI adapters grow a diffusion-aware
   compatibility surface.
-- Let `diffusion_canvas_length` narrow the canvas forward itself, not only what
-  the request owns, so a short read stops paying for the served canvas.
+- Publish an accuracy comparison between a tight canvas and the served one on a
+  real checkpoint, so `diffusion_canvas_length` can be recommended rather than
+  only offered.
 - Promote true batched canvas decode only if it wins on target GPUs; today the
   fused single-canvas path can be faster when one canvas already saturates the
   GPU.

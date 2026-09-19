@@ -110,8 +110,33 @@ Two differences are worth knowing:
 - open-jev applies a `[canvas, vocab]` logits mask each step. TensorSharp pins positions
   instead — the same effect at the positions that matter, without materializing the mask.
 - open-jev pads the canvas to the model's full width with EOS and always denoises it.
-  TensorSharp does the same by default; `DiffusionReadOptions.CanvasWidth` can narrow what
-  a request owns, but the forward is fixed-width, so a narrow canvas does not yet cost less.
+  TensorSharp does the same by default, and `CanvasFit = Tight` instead compiles the canvas
+  to the width the answers need and runs the forward there (see below).
+
+## Canvas width
+
+By default the answers are padded out to the model's served canvas with end-of-sequence
+tokens — the block the model was trained on. `CanvasFit = Tight` compiles the canvas to
+the width the answers actually need, plus one terminator, and the forward runs at that
+width:
+
+```csharp
+await predictor.PredictAsync(request, new StructuredPredictOptions
+{
+    CanvasFit = JsonCanvasFit.Tight,
+});
+```
+
+Attention, the MoE and the lm_head all scale with the canvas width, so for a short typed
+answer this is most of the cost. `PlanCanvasWidths` says what either fit would run at,
+without running anything, and the benchmark receipt records `canvas_widths` and
+`canvas_fit` beside the throughput — a documents-per-second figure cannot be read without
+knowing which canvas bought it.
+
+**It is not free.** A 32-wide canvas is a 32-token block, not a 256-token block with 224
+positions ignored. The model sees a shorter block than the one it was trained on, and the
+answer can move. Benchmark both fits on your own data and compare the accuracy, not only
+the throughput.
 
 ## Using a different model
 

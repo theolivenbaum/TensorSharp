@@ -27,8 +27,13 @@ namespace TensorSharp.Models
         /// long (the served canvas when no width is given). Null leaves the canvas random.</summary>
         public int[] SeedCanvas;
 
-        /// <summary>The leading canvas positions this request owns, at most the served canvas length.
-        /// Null (or 0) means the whole served canvas.</summary>
+        /// <summary>The canvas this request denoises, at most the served canvas length. Null means the
+        /// served canvas.
+        ///
+        /// The forward runs at this width - attention, the MoE and the lm_head all scale with it - so a
+        /// narrow read pays for its own canvas rather than the served one. It also changes what the model
+        /// sees: a 32-wide canvas is a 32-token block, not a 256-token block with 224 positions ignored.
+        /// Narrow when the answer's length is known (a templated read); leave it alone for free text.</summary>
         public int? CanvasWidth;
 
         /// <summary>Denoising steps before the canvas is emitted. Null keeps the sampler's default.</summary>

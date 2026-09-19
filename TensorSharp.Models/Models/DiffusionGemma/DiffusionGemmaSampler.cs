@@ -35,9 +35,11 @@ namespace TensorSharp.Models
         /// <see cref="CanvasWidth"/> long. Null keeps the random canvas.</summary>
         public int[] SeedCanvas = null;
 
-        /// <summary>The leading canvas positions this request owns; 0 means the whole served canvas.
-        /// The model forward is fixed-width, so the tail beyond this is still denoised - it is simply
-        /// not part of the request's canvas, and neither converges it nor is emitted.</summary>
+        /// <summary>The canvas this request denoises, at most the served canvas length; 0 means the
+        /// served canvas. The forward runs at this width - attention, the MoE and the lm_head all scale
+        /// with it - so a narrow request pays for its own canvas rather than the served one. It also
+        /// changes what the model sees: a 32-wide canvas is a 32-token block, not a 256-token block with
+        /// 224 positions ignored.</summary>
         public int CanvasWidth = 0;
 
         /// <summary>Emit the argmax canvas as soon as the step cap (or convergence) is reached and end
@@ -183,15 +185,16 @@ namespace TensorSharp.Models
             Action<int, int, int[]> stepCallback, CancellationToken ct)
         {
             int P = promptTokens.Length;
-            int C = _canvasLength;
             int W = WidthOf(p);
             int S = Math.Max(1, p.MaxDenoisingSteps);
             int vocab = _vocab;
 
             var rng = new DeterministicRng((ulong)p.Seed);
 
-            int[] currentCanvas = new int[C];
-            for (int i = 0; i < C; i++) currentCanvas[i] = rng.NextInt(vocab);
+            // The canvas IS W wide: the forward runs at this width, so a narrow read never pays for the
+            // served canvas.
+            int[] currentCanvas = new int[W];
+            for (int i = 0; i < W; i++) currentCanvas[i] = rng.NextInt(vocab);
             if (applySeed) ApplySeedCanvas(p, currentCanvas, W);
 
             // Self-conditioning reads the PREVIOUS step's logits. The model reads scBuffer at the START of
@@ -204,11 +207,11 @@ namespace TensorSharp.Models
             int[] prevArgmax = new int[W];
             for (int i = 0; i < W; i++) prevArgmax[i] = -1;
 
-            float[] entropy = new float[C];
-            int[] denoiser = new int[C];
-            int[] order = new int[C];
-            float[] u = new float[C];
-            int[] renoise = new int[C];
+            float[] entropy = new float[W];
+            int[] denoiser = new int[W];
+            int[] order = new int[W];
+            float[] u = new float[W];
+            int[] renoise = new int[W];
 
             // Prompt-KV caching: prefill the prompt's per-layer K/V once, then each step decodes only the
             // canvas (reading the cached prompt K/V). Falls back to the unified [prompt|canvas] forward.
@@ -220,7 +223,7 @@ namespace TensorSharp.Models
             }
             else
             {
-                tokens = new int[P + C];
+                tokens = new int[P + W];
                 Array.Copy(promptTokens, tokens, P);
             }
 
@@ -239,10 +242,10 @@ namespace TensorSharp.Models
             int[][] topTok = null; float[][] topPrb = null; int dbuf = 0;
             if (useDeviceSample)
             {
-                dArg = new int[C]; dSamp = new int[C];
+                dArg = new int[W]; dSamp = new int[W];
                 int kk = Math.Max(1, K);
-                topTok = new[] { new int[C * kk], new int[C * kk] };
-                topPrb = new[] { new float[C * kk], new float[C * kk] };
+                topTok = new[] { new int[W * kk], new int[W * kk] };
+                topPrb = new[] { new float[W * kk], new float[W * kk] };
             }
 
             float prevTempInv = 1f;
@@ -262,7 +265,7 @@ namespace TensorSharp.Models
                 {
                     // pre-draw step randomness (u then renoise per position) so the rng order matches the
                     // host sampler; u drives the on-device multinomial, renoise the rejected positions.
-                    for (int pos = 0; pos < C; pos++) { u[pos] = rng.NextFloat(); renoise[pos] = rng.NextInt(vocab); }
+                    for (int pos = 0; pos < W; pos++) { u[pos] = rng.NextFloat(); renoise[pos] = rng.NextInt(vocab); }
                     int[] scTok = stepIdx == 0 ? null : topTok[1 - dbuf];
                     float[] scPrb = stepIdx == 0 ? null : topPrb[1 - dbuf];
                     bool ok = _model.DecodeCanvasSampled(currentCanvas, scTok, scPrb, scUse, tempInv, u, K,
@@ -290,7 +293,7 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    for (int i = 0; i < C; i++) tokens[P + i] = currentCanvas[i];
+                    for (int i = 0; i < W; i++) tokens[P + i] = currentCanvas[i];
                     logits = _model.ForwardCanvas(tokens, P, scBuffer, scUse, prevTempInv);
                 }
 
@@ -370,12 +373,11 @@ namespace TensorSharp.Models
             int[] currentCanvas, int[] argmaxCanvas, int[] prevArgmax, ref int held,
             float[] entropy, int[] denoiser, int[] order, float[] u, int[] renoise, int width)
         {
-            int C = _canvasLength;
             int W = width;
             int vocab = _vocab;
 
             // pre-draw step randomness (single-threaded) for reproducibility
-            for (int pos = 0; pos < C; pos++)
+            for (int pos = 0; pos < W; pos++)
             {
                 u[pos] = rng.NextFloat();
                 renoise[pos] = rng.NextInt(vocab);
@@ -428,9 +430,6 @@ namespace TensorSharp.Models
                 currentCanvas[pos] = accepted[pos] ? denoiser[pos] : renoise[pos];
                 entropySum += entropy[pos];
             }
-            // Positions past the request's canvas are not its answer: they stay noise so nothing the model
-            // writes there can settle and read back as content.
-            for (int pos = W; pos < C; pos++) currentCanvas[pos] = renoise[pos];
 
             return AdaptiveStop(argmaxCanvas, prevArgmax, ref held, entropySum, W, p);
         }
@@ -474,7 +473,6 @@ namespace TensorSharp.Models
             DiffusionEbParams p, int[] currentCanvas, int[] argmaxCanvas, int[] prevArgmax, ref int held,
             int[] order, int width)
         {
-            int C = _canvasLength;
             int W = width;
             Array.Copy(argmaxIn, argmaxCanvas, W);   // emitted best-guess = device argmax
 
@@ -488,7 +486,6 @@ namespace TensorSharp.Models
                 currentCanvas[pos] = accepted[pos] ? sampledIn[pos] : renoise[pos];
                 entropySum += entropyIn[pos];
             }
-            for (int pos = W; pos < C; pos++) currentCanvas[pos] = renoise[pos];
 
             return AdaptiveStop(argmaxCanvas, prevArgmax, ref held, entropySum, W, p);
         }
@@ -511,7 +508,6 @@ namespace TensorSharp.Models
         {
             int A = active.Count;
             if (A == 0) return;
-            int C = _canvasLength;
             int vocab = _vocab;
 
             var seqs = new DiffusionSeqState[A];
@@ -571,39 +567,44 @@ namespace TensorSharp.Models
                 {
                     int P = run.Prefix.Count;
                     promptLen[a] = P;
-                    unifiedTokens[a] = new int[P + C];
+                    unifiedTokens[a] = new int[P + width[a]];
                     run.Prefix.CopyTo(unifiedTokens[a], 0);
                 }
 
                 int S = Math.Max(1, run.Params.MaxDenoisingSteps);
                 if (S > Smax) Smax = S;
                 rng[a] = new DeterministicRng((ulong)run.Params.Seed);
-                canvas[a] = new int[C];
-                for (int i = 0; i < C; i++) canvas[a][i] = rng[a].NextInt(vocab);
+                // Each sequence's canvas is its own width; the forward runs at that width.
+                canvas[a] = new int[width[a]];
+                for (int i = 0; i < width[a]; i++) canvas[a][i] = rng[a].NextInt(vocab);
                 // A seed canvas describes the answer being read, so it seeds the first block only.
                 if (run.BlockIndex == 0) ApplySeedCanvas(run.Params, canvas[a], width[a]);
                 argmaxCanvas[a] = new int[width[a]];
                 prevArgmax[a] = new int[width[a]];
                 for (int i = 0; i < width[a]; i++) prevArgmax[a][i] = -1;
                 // device sampling carries SC via the top-K buffers, so the 268 MB host logits buffer is unused
-                scBuffer[a] = (_model.SelfConditioningEnabled && !useDeviceSample) ? new float[(long)C * vocab] : null;
+                scBuffer[a] = (_model.SelfConditioningEnabled && !useDeviceSample)
+                    ? new float[(long)width[a] * vocab] : null;
                 prevTempInv[a] = 1f;
                 if (useDeviceSample)
                 {
                     int kk = Math.Max(1, K);
-                    dTopTok[a] = new[] { new int[C * kk], new int[C * kk] };
-                    dTopPrb[a] = new[] { new float[C * kk], new float[C * kk] };
-                    dArg[a] = new int[C];
-                    dSamp[a] = new int[C];
+                    dTopTok[a] = new[] { new int[width[a] * kk], new int[width[a] * kk] };
+                    dTopPrb[a] = new[] { new float[width[a] * kk], new float[width[a] * kk] };
+                    dArg[a] = new int[width[a]];
+                    dSamp[a] = new int[width[a]];
                 }
             }
 
-            // caller-owned per-step scratch (one set; the per-position work is over a single canvas at a time)
-            float[] entropy = new float[C];
-            int[] denoiser = new int[C];
-            int[] order = new int[C];
-            float[] u = new float[C];
-            int[] renoise = new int[C];
+            // caller-owned per-step scratch (one set; the per-position work is over a single canvas at a
+            // time). Sized to the widest canvas here, and every user reads only its own width.
+            int wMax = 0;
+            foreach (int w in width) if (w > wMax) wMax = w;
+            float[] entropy = new float[wMax];
+            int[] denoiser = new int[wMax];
+            int[] order = new int[wMax];
+            float[] u = new float[wMax];
+            int[] renoise = new int[wMax];
 
             // indices of sequences still denoising this block
             var live = new List<int>(A);
@@ -620,7 +621,9 @@ namespace TensorSharp.Models
                 int L = live.Count;
                 if (L == 0) break;
 
-                if (_useBatchedForward && usePkv && L > 1)
+                bool uniformWidth = true;
+                for (int j = 1; j < L; j++) if (width[live[j]] != width[live[0]]) uniformWidth = false;
+                if (_useBatchedForward && usePkv && L > 1 && uniformWidth)
                 {
                     // EXPERIMENTAL true-batched forward: all live canvases through one per-op forward. A win
                     // only when a single canvas under-utilises the GPU; a loss when compute-bound (this model).
@@ -648,7 +651,7 @@ namespace TensorSharp.Models
                     {
                         int a = live[j];
                         var run = active[a];
-                        if (scBuffer[a] != null) Array.Copy(logits[j], scBuffer[a], (long)C * vocab);
+                        if (scBuffer[a] != null) Array.Copy(logits[j], scBuffer[a], (long)width[a] * vocab);
                         int Sa = Math.Max(1, run.Params.MaxDenoisingSteps);
                         bool seqFinished = DenoiseStep(logits[j], subTempInv[j], rng[a], run.Params,
                             canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u,
@@ -681,7 +684,7 @@ namespace TensorSharp.Models
 
                         if (useDeviceSample)
                         {
-                            for (int pos = 0; pos < C; pos++) { u[pos] = rng[a].NextFloat(); renoise[pos] = rng[a].NextInt(vocab); }
+                            for (int pos = 0; pos < width[a]; pos++) { u[pos] = rng[a].NextFloat(); renoise[pos] = rng[a].NextInt(vocab); }
                             int[] scTok = stepIdx == 0 ? null : dTopTok[a][1 - dBuf[a]];
                             float[] scPrb = stepIdx == 0 ? null : dTopPrb[a][1 - dBuf[a]];
                             bool ok = _model.DecodeCanvasSampledSeq(seqs[a], canvas[a], scTok, scPrb, scUse, tempInv, u, K,
@@ -708,10 +711,10 @@ namespace TensorSharp.Models
                         }
                         else
                         {
-                            Array.Copy(canvas[a], 0, unifiedTokens[a], promptLen[a], C);
+                            Array.Copy(canvas[a], 0, unifiedTokens[a], promptLen[a], width[a]);
                             lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
                         }
-                        if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)C * vocab);
+                        if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)width[a] * vocab);
                         bool seqFinished = DenoiseStep(lg, tempInv, rng[a], run.Params,
                             canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u,
                             renoise, width[a]);

@@ -1382,12 +1382,22 @@ namespace TensorSharp.Models
         /// <summary>Decode B canvases in one batched forward, returning each sequence's canvas logits
         /// [C, vocab]. <paramref name="canvases"/>/<paramref name="scPrev"/>/<paramref name="scUse"/>/
         /// <paramref name="prevTempInv"/> are per-sequence (length B). Per-op device path; the heavy matmuls
-        /// run once over all B*C rows, attention loops per sequence over its own prompt K/V.</summary>
+        /// run once over all B*C rows, attention loops per sequence over its own prompt K/V.
+        ///
+        /// The batch is one tensor of B*C rows, so every canvas must be the same width - the caller sends
+        /// mixed widths through the per-sequence path instead.</summary>
         public unsafe float[][] DecodeCanvasBatched(DiffusionSeqState[] seqs, int[][] canvases,
             float[][] scPrev, float[] scUse, float[] prevTempInv)
         {
             int B = seqs.Length;
-            int C = _canvasLength;
+            int C = canvases[0].Length;
+            for (int b = 1; b < B; b++)
+            {
+                if (canvases[b].Length != C)
+                    throw new ArgumentException(
+                        "A batched canvas decode needs one canvas width across the batch; got " +
+                        $"{canvases[b].Length} and {C}.", nameof(canvases));
+            }
             int D = Config.HiddenSize;
             int vocab = Config.VocabSize;
             float eps = Config.Eps;

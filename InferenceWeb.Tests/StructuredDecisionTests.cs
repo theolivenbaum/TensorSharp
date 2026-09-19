@@ -66,6 +66,7 @@ public class StructuredDecisionTests
 
         public int Reads { get; private set; }
         public List<int> BatchSizes { get; } = new();
+        public List<int> Widths { get; } = new();
 
         public ITokenizer Tokenizer { get; } = new CharTokenizer();
         public int CanvasLength => StructuredDecisionTests.CanvasLength;
@@ -87,7 +88,11 @@ public class StructuredDecisionTests
         private DiffusionReadResult Answer(StructuredRead read)
         {
             JsonCanvasLayout layout = JsonCanvasLayout.Compile(
-                Tokenizer, QuestionsOnCanvas(read), CanvasLength, EosTokenId);
+                Tokenizer, QuestionsOnCanvas(read), CanvasLength, EosTokenId,
+                // The read declares the width it wants the forward to run at; a tight canvas is shorter
+                // than the served one, so the layout has to be rebuilt the same way.
+                read.Options.CanvasWidth < CanvasLength ? JsonCanvasFit.Tight : JsonCanvasFit.ServedCanvas);
+            Widths.Add(read.Options.CanvasWidth ?? CanvasLength);
             var prefer = layout.Questions.ToDictionary(
                 q => q.Key,
                 q => Math.Max(0, q.Value.Options.ToList().FindIndex(
@@ -154,7 +159,7 @@ public class StructuredDecisionTests
             Assert.NotNull(layout.LogprobTokenIds[pos]);
             Assert.True(layout.LogprobTokenIds[pos].Length > 1);
         }
-        for (int pos = 0; pos < CanvasLength; pos++)
+        for (int pos = 0; pos < layout.CanvasWidth; pos++)
         {
             if (layout.VariablePositions.Contains(pos)) continue;
             Assert.True(layout.PinnedPositions[pos]);
@@ -196,6 +201,66 @@ public class StructuredDecisionTests
         Assert.Contains("canvas holds", ex.Message);
     }
 
+    [Fact]
+    public void ATightCanvasIsOnlyAsWideAsTheAnswersNeed()
+    {
+        var served = Compile(TwoQuestions());
+        var tight = JsonCanvasLayout.Compile(
+            Tokenizer(), TwoQuestions(), CanvasLength, eosTokenId: 0, JsonCanvasFit.Tight);
+
+        Assert.Equal(CanvasLength, served.CanvasWidth);
+        Assert.True(tight.CanvasWidth < served.CanvasWidth);
+
+        // The JSON is the same; only the padding the forward has to carry is gone - bar one terminator,
+        // so the model sees an answer that ended rather than a block that stopped.
+        Assert.Equal(
+            Tokenizer().Decode(served.SeedCanvas.ToList()),
+            Tokenizer().Decode(tight.SeedCanvas.ToList()));
+        Assert.Equal(0, tight.SeedCanvas[^1]);
+        Assert.True(tight.PinnedPositions[^1]);
+
+        // The answer slots are the same positions either way.
+        Assert.Equal(served.VariablePositions, tight.VariablePositions);
+    }
+
+    [Fact]
+    public void ATightCanvasNeverOutgrowsTheServedOne()
+    {
+        // The tight width is the JSON plus a terminator, which for a canvas-filling question set would
+        // run past the served canvas; it is capped there instead.
+        var questions = new Dictionary<string, StructuredQuestion>();
+        for (int i = 0; ; i++)
+        {
+            var trial = new Dictionary<string, StructuredQuestion>(questions)
+            {
+                [$"q{i}"] = StructuredQuestion.Boolean("Is it so?"),
+            };
+            try { Compile(trial); }
+            catch (ArgumentException) { break; }
+            questions = trial;
+        }
+
+        var tight = JsonCanvasLayout.Compile(
+            Tokenizer(), questions, CanvasLength, eosTokenId: 0, JsonCanvasFit.Tight);
+        Assert.True(tight.CanvasWidth <= CanvasLength);
+    }
+
+    [Fact]
+    public async Task ATightFitAsksTheModelForANarrowerForward()
+    {
+        var requests = new[] { Request("t", ("urgent", StructuredQuestion.Boolean("Urgent?"))) };
+
+        var (_, wide) = await Predict(requests, _ => true,
+            new StructuredPredictOptions { CanvasFit = JsonCanvasFit.ServedCanvas });
+        var (predictions, narrow) = await Predict(requests, _ => true,
+            new StructuredPredictOptions { CanvasFit = JsonCanvasFit.Tight });
+
+        Assert.Equal(CanvasLength, Assert.Single(wide.Widths));
+        Assert.True(Assert.Single(narrow.Widths) < CanvasLength);
+        // Same answer either way: the width is what the forward costs, not what it decides.
+        Assert.Equal(true, Assert.Single(predictions).Values["urgent"]);
+    }
+
     // ---- The readout -------------------------------------------------------
 
     /// <summary>Score every allowed token the canvas asks about, with <paramref name="prefer"/>'s tokens
@@ -203,15 +268,16 @@ public class StructuredDecisionTests
     private static DiffusionPositionLogprobs[] Scores(
         JsonCanvasLayout layout, IReadOnlyDictionary<string, int> prefer)
     {
-        var positions = new DiffusionPositionLogprobs[CanvasLength];
-        var target = new int[CanvasLength];
-        Array.Copy(layout.SeedCanvas, target, CanvasLength);
+        int width = layout.CanvasWidth;
+        var positions = new DiffusionPositionLogprobs[width];
+        var target = new int[width];
+        Array.Copy(layout.SeedCanvas, target, width);
         foreach ((string key, int index) in prefer)
         {
             int[] run = layout.CandidateTokens(key)[index];
             Array.Copy(run, 0, target, layout.SlotOffset(key), run.Length);
         }
-        for (int pos = 0; pos < CanvasLength; pos++)
+        for (int pos = 0; pos < width; pos++)
         {
             int[]? ids = layout.LogprobTokenIds[pos];
             positions[pos] = ids is null
@@ -472,6 +538,10 @@ public class StructuredDecisionTests
         Assert.Equal(3, report.Cases);
         Assert.Equal(3, report.CanvasesPerPass);
         Assert.Equal(0, report.SplitCases);
+        // The receipt says what the forward actually ran at, so a throughput number cannot be read
+        // without knowing which canvas bought it.
+        Assert.Equal(new[] { CanvasLength }, report.CanvasWidths);
+        Assert.Equal("ServedCanvas", report.CanvasFit);
     }
 
     [Fact]

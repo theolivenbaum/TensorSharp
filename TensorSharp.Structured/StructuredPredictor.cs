@@ -30,6 +30,16 @@ namespace TensorSharp.Structured
         /// <summary>Canvases denoised together in one forward pass. The whole batch is one pass, so this
         /// is the throughput knob; too large a value runs the device out of memory.</summary>
         public int BatchSize { get; init; } = 16;
+
+        /// <summary>
+        /// How wide a canvas the answers are compiled onto.
+        ///
+        /// <see cref="JsonCanvasFit.Tight"/> runs the forward at the width the answers need instead of the
+        /// served canvas, which is most of the cost of a short typed answer - attention, the MoE and the
+        /// lm_head all scale with it. It is not free: the model then sees a short block rather than the
+        /// padded one it was trained on, so measure the accuracy, not only the throughput.
+        /// </summary>
+        public JsonCanvasFit CanvasFit { get; init; } = JsonCanvasFit.ServedCanvas;
     }
 
     /// <summary>
@@ -79,7 +89,7 @@ namespace TensorSharp.Structured
             if (options.BatchSize < 1)
                 throw new ArgumentException("Batch size must be positive.", nameof(options));
 
-            List<CanvasJob> jobs = requests.SelectMany(Plan).ToList();
+            List<CanvasJob> jobs = requests.SelectMany(r => Plan(r, options.CanvasFit)).ToList();
             var results = new DiffusionReadResult[jobs.Count];
             for (int offset = 0; offset < jobs.Count; offset += options.BatchSize)
             {
@@ -95,8 +105,15 @@ namespace TensorSharp.Structured
 
         /// <summary>The canvases a batch would denoise, without running anything. Useful for sizing a
         /// benchmark and for seeing where a request had to be split.</summary>
-        public IReadOnlyList<int> PlanCanvasCounts(IReadOnlyList<StructuredRequest> requests) =>
-            requests.Select(r => Plan(r).Count).ToList();
+        public IReadOnlyList<int> PlanCanvasCounts(
+            IReadOnlyList<StructuredRequest> requests, JsonCanvasFit fit = JsonCanvasFit.ServedCanvas) =>
+            requests.Select(r => Plan(r, fit).Count).ToList();
+
+        /// <summary>The canvas widths a batch would denoise, one entry per canvas. Under
+        /// <see cref="JsonCanvasFit.Tight"/> this is what the forward actually costs.</summary>
+        public IReadOnlyList<int> PlanCanvasWidths(
+            IReadOnlyList<StructuredRequest> requests, JsonCanvasFit fit = JsonCanvasFit.ServedCanvas) =>
+            requests.SelectMany(r => Plan(r, fit)).Select(job => job.Layout.CanvasWidth).ToList();
 
         // ---- Planning ----------------------------------------------------------
 
@@ -108,7 +125,7 @@ namespace TensorSharp.Structured
         /// A question is added while the canvas still compiles; the first one that does not starts a new
         /// canvas. A single question too large for an empty canvas is an error - nothing can carry it.
         /// </summary>
-        private List<CanvasJob> Plan(StructuredRequest request)
+        private List<CanvasJob> Plan(StructuredRequest request, JsonCanvasFit fit)
         {
             request.Validate();
             var jobs = new List<CanvasJob>();
@@ -121,13 +138,13 @@ namespace TensorSharp.Structured
                 JsonCanvasLayout layout;
                 try
                 {
-                    layout = Compile(trial);
+                    layout = Compile(trial, fit);
                 }
                 catch (ArgumentException) when (packed.Count > 0)
                 {
                     jobs.Add(new CanvasJob(request, compiled!, BuildPrompt(request.Document, packed)));
                     packed = new Dictionary<string, StructuredQuestion> { [key] = question };
-                    compiled = Compile(packed);
+                    compiled = Compile(packed, fit);
                     continue;
                 }
                 packed = trial;
@@ -138,9 +155,10 @@ namespace TensorSharp.Structured
             return jobs;
         }
 
-        private JsonCanvasLayout Compile(IReadOnlyDictionary<string, StructuredQuestion> questions) =>
+        private JsonCanvasLayout Compile(
+            IReadOnlyDictionary<string, StructuredQuestion> questions, JsonCanvasFit fit) =>
             JsonCanvasLayout.Compile(
-                _reader.Tokenizer, questions, _reader.CanvasLength, _reader.EosTokenId);
+                _reader.Tokenizer, questions, _reader.CanvasLength, _reader.EosTokenId, fit);
 
         private static StructuredRead ToRead(CanvasJob job, StructuredPredictOptions options) => new()
         {
@@ -150,6 +168,8 @@ namespace TensorSharp.Structured
             {
                 ReadOnly = true,
                 MaxSteps = options.Steps,
+                // The forward runs at the layout's width, not the served canvas.
+                CanvasWidth = job.Layout.CanvasWidth,
                 SeedCanvas = job.Layout.SeedCanvas,
                 PinnedPositions = job.Layout.PinnedPositions,
                 LogprobTokenIds = job.Layout.LogprobTokenIds,

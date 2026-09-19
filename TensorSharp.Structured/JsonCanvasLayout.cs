@@ -16,6 +16,20 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Structured
 {
+    /// <summary>How wide a canvas the answers are compiled onto.</summary>
+    public enum JsonCanvasFit
+    {
+        /// <summary>The model's served canvas, with the JSON padded out to it by end-of-sequence tokens.
+        /// The block the model sees is the one it was trained on.</summary>
+        ServedCanvas,
+
+        /// <summary>Only as wide as the answers need, plus one end-of-sequence terminator. The forward
+        /// runs at that width, so a short answer stops paying for the served canvas - but the model then
+        /// sees a short block rather than the padded one it was trained on, which can move the
+        /// answer.</summary>
+        Tight,
+    }
+
     /// <summary>
     /// A JSON canvas whose scaffolding is fixed and whose answer slots are free.
     ///
@@ -58,6 +72,9 @@ namespace TensorSharp.Structured
 
         /// <summary>Canvas positions that denoise freely.</summary>
         public IReadOnlyList<int> VariablePositions { get; }
+
+        /// <summary>The canvas width this layout was compiled for - what the forward will run at.</summary>
+        public int CanvasWidth => SeedCanvas.Length;
 
         private JsonCanvasLayout(
             ITokenizer tokenizer,
@@ -102,7 +119,8 @@ namespace TensorSharp.Structured
             ITokenizer tokenizer,
             IReadOnlyDictionary<string, StructuredQuestion> questions,
             int canvasLength,
-            int eosTokenId)
+            int eosTokenId,
+            JsonCanvasFit fit = JsonCanvasFit.ServedCanvas)
         {
             ArgumentNullException.ThrowIfNull(tokenizer);
             ArgumentNullException.ThrowIfNull(questions);
@@ -153,12 +171,17 @@ namespace TensorSharp.Structured
 
             VerifyRoundTrip(tokenizer, questions, template, slots);
 
+            // A tight canvas still carries one end-of-sequence token: without a terminator the model is
+            // looking at a block that simply stops, rather than one whose answer has ended.
+            int width = fit == JsonCanvasFit.Tight
+                ? Math.Min(template.Count + 1, canvasLength)
+                : canvasLength;
             int[] seed = template
-                .Concat(Enumerable.Repeat(eosTokenId, canvasLength - template.Count))
+                .Concat(Enumerable.Repeat(eosTokenId, width - template.Count))
                 .ToArray();
-            var pinned = new bool[canvasLength];
+            var pinned = new bool[width];
             Array.Fill(pinned, true);
-            var logprobIds = new int[canvasLength][];
+            var logprobIds = new int[width][];
             foreach (Slot slot in slots)
             {
                 foreach ((int position, _, int[] allowed) in slot.Variables)

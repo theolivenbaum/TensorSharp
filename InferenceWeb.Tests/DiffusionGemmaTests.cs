@@ -879,6 +879,80 @@ public class DiffusionGemmaTests
             i => result.Canvas[i] != pinnedToken);
     }
 
+    // The read's canvas width is what the forward runs at - attention, the MoE and the lm_head all scale
+    // with it - so a short templated answer must not pay for the served canvas. This used to be the case:
+    // a narrow request kept denoising the full canvas and simply ignored the tail.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void ANarrowCanvasCostsLessThanTheServedOne()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        int narrow = Math.Max(8, model.CanvasLength / 8);
+        var prompt = RenderPrompt(model, "What is the capital of France?");
+        var sampler = new DiffusionGemmaSampler(model);
+
+        double Time(int width)
+        {
+            var p = FixedStepParams(2);
+            new DiffusionReadOptions { ReadOnly = true, MaxSteps = 2, CanvasWidth = width }
+                .ApplyTo(p, model.CanvasLength);
+            sampler.Read(prompt, p);                 // warm this width's masks and graphs
+            var sw = Stopwatch.StartNew();
+            var result = sampler.Read(prompt, p);
+            sw.Stop();
+            Assert.Equal(width, result.Canvas.Length);
+            return sw.Elapsed.TotalMilliseconds;
+        }
+
+        double wide = Time(model.CanvasLength);
+        double thin = Time(narrow);
+        _output.WriteLine($"[diffusion-gemma][width] {model.CanvasLength}-wide={wide:F0}ms " +
+            $"{narrow}-wide={thin:F0}ms speedup={wide / thin:F2}x");
+
+        Assert.True(thin < wide,
+            $"a {narrow}-wide canvas ({thin:F0}ms) was not cheaper than a " +
+            $"{model.CanvasLength}-wide one ({wide:F0}ms)");
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public async Task ATightStructuredCanvas_AnswersTheSameQuestionsForLess()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var request = new StructuredRequest
+        {
+            Id = "refund",
+            Document = "I was charged twice for the same order. Please refund the duplicate.",
+            Questions = new Dictionary<string, StructuredQuestion>
+            {
+                ["refund_requested"] = StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+            },
+        };
+        var predictor = new StructuredPredictor(new DiffusionGemmaReader(model));
+        var requests = new[] { request };
+
+        int served = predictor.PlanCanvasWidths(requests)[0];
+        int tight = predictor.PlanCanvasWidths(requests, JsonCanvasFit.Tight)[0];
+        Assert.Equal(model.CanvasLength, served);
+        Assert.True(tight < served);
+
+        var prediction = await predictor.PredictAsync(request, new StructuredPredictOptions
+        {
+            Steps = 1,
+            Seed = 0,
+            CanvasFit = JsonCanvasFit.Tight,
+        });
+
+        _output.WriteLine($"[diffusion-gemma][structured] tight canvas {tight} (served {served}): " +
+            prediction.Json);
+        // Narrower forward, same contract: a complete answer in the allowed language.
+        Assert.Contains(request.Questions["refund_requested"].Options,
+            o => System.Text.Json.JsonSerializer.Serialize(o)
+                == System.Text.Json.JsonSerializer.Serialize(prediction.Values["refund_requested"]));
+    }
+
     [ModelFact(EnvModelDir, GgufPattern)]
     public async Task StructuredDecision_AnswersEveryQuestion_InItsAllowedLanguage()
     {

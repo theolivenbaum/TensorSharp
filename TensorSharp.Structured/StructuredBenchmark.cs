@@ -58,6 +58,11 @@ namespace TensorSharp.Structured
 
         /// <summary>Where the rate came from, carried into the receipt.</summary>
         public string? PricingSource { get; init; }
+
+        /// <summary>How wide a canvas the answers are compiled onto. <see cref="JsonCanvasFit.Tight"/>
+        /// runs the forward at the width the answers need; compare its accuracy against
+        /// <see cref="JsonCanvasFit.ServedCanvas"/>, not only its throughput.</summary>
+        public JsonCanvasFit CanvasFit { get; init; } = JsonCanvasFit.ServedCanvas;
     }
 
     /// <summary>What one batch size achieved.</summary>
@@ -111,6 +116,11 @@ namespace TensorSharp.Structured
         [JsonPropertyName("cases")] public required int Cases { get; init; }
         [JsonPropertyName("questions")] public required int Questions { get; init; }
         [JsonPropertyName("canvases_per_pass")] public required int CanvasesPerPass { get; init; }
+
+        /// <summary>The canvas width the forward ran at, widest first. Under the served-canvas fit this is
+        /// the model's canvas whatever the answers need; under the tight fit it is what they needed.</summary>
+        [JsonPropertyName("canvas_widths")] public required IReadOnlyList<int> CanvasWidths { get; init; }
+        [JsonPropertyName("canvas_fit")] public required string CanvasFit { get; init; }
         [JsonPropertyName("split_cases")] public required int SplitCases { get; init; }
         [JsonPropertyName("steps")] public required int Steps { get; init; }
         [JsonPropertyName("seed")] public required int Seed { get; init; }
@@ -158,7 +168,7 @@ namespace TensorSharp.Structured
             if (options.Repeats < 1) throw new ArgumentException("Need at least one timed pass.", nameof(options));
 
             IReadOnlyList<StructuredRequest> requests = cases.Select(c => c.Request).ToList();
-            IReadOnlyList<int> canvasCounts = _predictor.PlanCanvasCounts(requests);
+            IReadOnlyList<int> canvasCounts = _predictor.PlanCanvasCounts(requests, options.CanvasFit);
 
             var summaries = new List<StructuredBenchmarkSummary>();
             var failures = new List<StructuredBenchmarkFailure>();
@@ -188,6 +198,9 @@ namespace TensorSharp.Structured
                 Cases = cases.Count,
                 Questions = cases.Sum(c => c.Request.Questions.Count),
                 CanvasesPerPass = canvasCounts.Sum(),
+                CanvasWidths = _predictor.PlanCanvasWidths(requests, options.CanvasFit)
+                    .Distinct().OrderDescending().ToList(),
+                CanvasFit = options.CanvasFit.ToString(),
                 SplitCases = canvasCounts.Count(n => n > 1),
                 Steps = options.Steps,
                 Seed = options.Seed,
@@ -218,6 +231,7 @@ namespace TensorSharp.Structured
                 Steps = options.Steps,
                 Seed = options.Seed,
                 BatchSize = batchSize,
+                CanvasFit = options.CanvasFit,
             };
 
             for (int i = 0; i < options.Warmups; i++)
