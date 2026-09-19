@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -58,6 +58,60 @@ namespace TensorSharp.Models
                 scores[i] = ids[i] < 0 ? float.NegativeInfinity : scores[i] - logZ;
 
             return new DiffusionPositionLogprobs(ids, scores);
+        }
+
+        /// <summary>
+        /// The temperature-1 log-probabilities of exactly <paramref name="ids"/>, in the order given.
+        ///
+        /// A constrained readout needs the score of every allowed token at a slot, and an allowed token
+        /// can sit far outside the top-K - so it asks for the ids it cares about rather than for a rank.
+        /// </summary>
+        public static DiffusionPositionLogprobs ScoresFor(ReadOnlySpan<float> rowLogits, int[] ids)
+        {
+            if (ids == null) throw new ArgumentNullException(nameof(ids));
+            int vocab = rowLogits.Length;
+            if (vocab == 0) throw new ArgumentException("Empty logits row.", nameof(rowLogits));
+
+            float m = float.NegativeInfinity;
+            for (int v = 0; v < vocab; v++) if (rowLogits[v] > m) m = rowLogits[v];
+            float sumExp = 0f;
+            for (int v = 0; v < vocab; v++) sumExp += MathF.Exp(rowLogits[v] - m);
+            float logZ = m + MathF.Log(sumExp);
+
+            var scores = new float[ids.Length];
+            for (int i = 0; i < ids.Length; i++)
+            {
+                int id = ids[i];
+                if (id < 0 || id >= vocab)
+                    throw new ArgumentOutOfRangeException(nameof(ids), $"Token id {id} is outside [0, {vocab}).");
+                scores[i] = rowLogits[id] - logZ;
+            }
+            return new DiffusionPositionLogprobs((int[])ids.Clone(), scores);
+        }
+
+        /// <summary>
+        /// Per canvas position, either the scores of the ids <paramref name="requested"/> names for it or -
+        /// where it names none - the position's top <paramref name="k"/>. A position with neither is
+        /// reported empty.
+        /// </summary>
+        public static DiffusionPositionLogprobs[] PerPosition(
+            float[] logits, int width, int vocab, int k, int[][] requested)
+        {
+            if (logits == null) throw new ArgumentNullException(nameof(logits));
+            if (width < 0 || (long)width * vocab > logits.LongLength)
+                throw new ArgumentOutOfRangeException(nameof(width),
+                    "The logits buffer is shorter than the requested canvas width.");
+
+            var result = new DiffusionPositionLogprobs[width];
+            Parallel.For(0, width, pos =>
+            {
+                var row = new ReadOnlySpan<float>(logits, pos * vocab, vocab);
+                int[] ids = requested != null && pos < requested.Length ? requested[pos] : null;
+                result[pos] = ids is { Length: > 0 } ? ScoresFor(row, ids)
+                    : k > 0 ? TopK(row, k)
+                    : new DiffusionPositionLogprobs(Array.Empty<int>(), Array.Empty<float>());
+            });
+            return result;
         }
 
         /// <summary>

@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -41,6 +41,17 @@ namespace TensorSharp.Models
         /// <summary>How many top tokens to report per canvas position, at temperature 1. 0 reports none.
         /// Only read-only requests report logprobs.</summary>
         public int TopLogprobs;
+
+        /// <summary>Per canvas position, the token ids to report the score of, instead of that position's
+        /// top-K. A constrained readout needs the score of every allowed token at a slot, and an allowed
+        /// token can sit far outside any top-K. Null, or a null row, falls back to
+        /// <see cref="TopLogprobs"/>.</summary>
+        public int[][] LogprobTokenIds;
+
+        /// <summary>Per canvas position, whether it is pinned to its <see cref="SeedCanvas"/> value for
+        /// the whole read. This is what fixes the scaffolding of a templated canvas - the JSON a typed
+        /// answer has to come back in - while the free slots denoise.</summary>
+        public bool[] PinnedPositions;
 
         /// <summary>The canvas this request denoises: its own width, else the served one.</summary>
         public int EffectiveWidth(int servedCanvasLength) =>
@@ -88,6 +99,42 @@ namespace TensorSharp.Models
                 throw new ArgumentException(
                     "diffusion_top_logprobs needs diffusion_read_only: only a read emits per-position " +
                     "distributions.", nameof(TopLogprobs));
+
+            if (LogprobTokenIds != null)
+            {
+                if (!ReadOnly)
+                    throw new ArgumentException(
+                        "diffusion_logprob_token_ids needs diffusion_read_only: only a read emits " +
+                        "per-position distributions.", nameof(LogprobTokenIds));
+                if (LogprobTokenIds.Length != expectedLen)
+                    throw new ArgumentException(
+                        $"diffusion_logprob_token_ids must hold exactly {expectedLen} rows, got " +
+                        $"{LogprobTokenIds.Length}.", nameof(LogprobTokenIds));
+                foreach (int[] row in LogprobTokenIds)
+                {
+                    if (row == null) continue;
+                    foreach (int t in row)
+                    {
+                        if (t < 0 || t >= vocabSize)
+                            throw new ArgumentException(
+                                $"diffusion_logprob_token_ids ids must be in [0, {vocabSize}).",
+                                nameof(LogprobTokenIds));
+                    }
+                }
+            }
+
+            if (PinnedPositions != null)
+            {
+                // A pin holds a position at its seed value, so there has to be one to hold it at.
+                if (SeedCanvas == null)
+                    throw new ArgumentException(
+                        "diffusion_pinned_positions needs a diffusion_seed_canvas to pin to.",
+                        nameof(PinnedPositions));
+                if (PinnedPositions.Length != expectedLen)
+                    throw new ArgumentException(
+                        $"diffusion_pinned_positions must hold exactly {expectedLen} flags, got " +
+                        $"{PinnedPositions.Length}.", nameof(PinnedPositions));
+            }
         }
 
         /// <summary>
@@ -104,6 +151,8 @@ namespace TensorSharp.Models
             if (MaxSteps is { } steps) p.MaxDenoisingSteps = Math.Max(1, steps);
             p.ReadOnly = ReadOnly;
             p.TopLogprobs = TopLogprobs;
+            p.LogprobTokenIds = LogprobTokenIds;
+            p.PinnedCanvas = PinnedPositions;
             if (ReadOnly) p.MaxBlocks = 1;
         }
     }

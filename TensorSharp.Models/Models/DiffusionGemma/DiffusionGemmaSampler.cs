@@ -46,6 +46,17 @@ namespace TensorSharp.Models
 
         /// <summary>Top tokens to report per canvas position, at temperature 1. Read-only only.</summary>
         public int TopLogprobs = 0;
+
+        /// <summary>Per canvas position, the token ids to report the score of, instead of that position's
+        /// top-K. A constrained readout needs the score of every allowed token at a slot, and an allowed
+        /// token can sit far outside any top-K. Null rows fall back to <see cref="TopLogprobs"/>.</summary>
+        public int[][] LogprobTokenIds = null;
+
+        /// <summary>Per canvas position, whether it is pinned: it holds its <see cref="SeedCanvas"/> value
+        /// for the whole read and is never re-noised. This is the cheap form of a logits mask that allows
+        /// exactly one token there - a pinned position contributes no entropy and settles immediately - and
+        /// it is what fixes the scaffolding of a templated canvas while the free slots denoise.</summary>
+        public bool[] PinnedCanvas = null;
     }
 
     /// <summary>
@@ -216,7 +227,7 @@ namespace TensorSharp.Models
             // A read reports the distribution itself, which only the full logits carry. The on-device
             // sampler returns a top-K taken at the step's temperature, so such a request stays on the host
             // logits path - one readback per step, over the handful of steps a read runs.
-            bool wantLogprobs = p.ReadOnly && p.TopLogprobs > 0;
+            bool wantLogprobs = p.ReadOnly && (p.TopLogprobs > 0 || p.LogprobTokenIds != null);
 
             // On-device sampling (CUDA): the lm_head kernel returns argmax/entropy/sampled/top-K directly,
             // so the full [vocab,C] logits never cross PCIe and no host full-vocab CPU sweep runs. Needs the
@@ -292,7 +303,8 @@ namespace TensorSharp.Models
                 // Only the step that emits is reported, so the top-K sweep runs once per read rather than
                 // once per step. These logits are still this step's; the next forward overwrites them.
                 if (wantLogprobs && (finished || curStep == 1))
-                    logprobs = DiffusionLogprobs.TopKPerPosition(logits, W, vocab, p.TopLogprobs);
+                    logprobs = DiffusionLogprobs.PerPosition(
+                        logits, W, vocab, p.TopLogprobs, p.LogprobTokenIds);
 
                 // hand this step's logits to the next step's self-conditioning (no copy; see scBuffer note)
                 if (_model.SelfConditioningEnabled) scBuffer = logits;
@@ -304,7 +316,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Overwrite the request's canvas positions with its seed ids. The tail past
-        /// <paramref name="width"/> keeps its noise: it is outside the request's canvas.</summary>
+        /// <paramref name="width"/> keeps its noise: it is outside the request's canvas. With a pin mask
+        /// only the pinned positions are seeded - the free slots start from the sampler's own noise, which
+        /// is what a templated canvas wants.</summary>
         private static void ApplySeedCanvas(DiffusionEbParams p, int[] canvas, int width)
         {
             int[] seed = p.SeedCanvas;
@@ -312,7 +326,36 @@ namespace TensorSharp.Models
             if (seed.Length != width)
                 throw new ArgumentException(
                     $"SeedCanvas must hold exactly {width} ids, got {seed.Length}.", nameof(p));
-            Array.Copy(seed, canvas, width);
+            bool[] pinned = p.PinnedCanvas;
+            if (pinned == null)
+            {
+                Array.Copy(seed, canvas, width);
+                return;
+            }
+            if (pinned.Length != width)
+                throw new ArgumentException(
+                    $"PinnedCanvas must hold exactly {width} flags, got {pinned.Length}.", nameof(p));
+            for (int i = 0; i < width; i++) if (pinned[i]) canvas[i] = seed[i];
+        }
+
+        /// <summary>Hold the pinned positions of a step at their seed value: the emitted canvas takes the
+        /// seed token, the next canvas takes it whichever way the accept falls, and the position reports
+        /// zero entropy - the same thing a logits mask allowing one token there would produce, without the
+        /// [canvas, vocab] mask.</summary>
+        private static void ApplyPins(DiffusionEbParams p, int width, int[] argmaxCanvas,
+            int[] accept, int[] reject, float[] entropy)
+        {
+            bool[] pinned = p.PinnedCanvas;
+            if (pinned == null) return;
+            int[] seed = p.SeedCanvas;
+            for (int pos = 0; pos < width; pos++)
+            {
+                if (!pinned[pos]) continue;
+                argmaxCanvas[pos] = seed[pos];
+                accept[pos] = seed[pos];
+                reject[pos] = seed[pos];
+                entropy[pos] = 0f;
+            }
         }
 
         /// <summary>One denoising step's host-side work, shared by the single-request <see cref="DenoiseBlock"/>
@@ -375,6 +418,7 @@ namespace TensorSharp.Models
                 },
                 _ => { });
 
+            ApplyPins(p, W, argmaxCanvas, denoiser, renoise, entropy);
             var accepted = AcceptLowestEntropy(entropy, order, W, p.EntropyBound);
 
             // renoise: accepted -> sampled token, rest -> fresh random; output = argmax canvas
@@ -434,6 +478,7 @@ namespace TensorSharp.Models
             int W = width;
             Array.Copy(argmaxIn, argmaxCanvas, W);   // emitted best-guess = device argmax
 
+            ApplyPins(p, W, argmaxCanvas, sampledIn, renoise, entropyIn);
             var accepted = AcceptLowestEntropy(entropyIn, order, W, p.EntropyBound);
 
             // renoise: accepted -> device multinomial sample, rest -> fresh random; output = argmax canvas
@@ -490,7 +535,8 @@ namespace TensorSharp.Models
             for (int a = 0; a < A; a++)
             {
                 width[a] = WidthOf(active[a].Params);
-                wantLogprobs[a] = active[a].Params.ReadOnly && active[a].Params.TopLogprobs > 0;
+                wantLogprobs[a] = active[a].Params.ReadOnly
+                    && (active[a].Params.TopLogprobs > 0 || active[a].Params.LogprobTokenIds != null);
             }
             int Smax = 1;
 
@@ -610,8 +656,9 @@ namespace TensorSharp.Models
                         prevTempInv[a] = subTempInv[j];
                         stepsRun[a]++;
                         if (wantLogprobs[a] && (seqFinished || stepsRun[a] >= Sa))
-                            logprobs[a] = DiffusionLogprobs.TopKPerPosition(
-                                logits[j], width[a], vocab, run.Params.TopLogprobs);
+                            logprobs[a] = DiffusionLogprobs.PerPosition(
+                                logits[j], width[a], vocab, run.Params.TopLogprobs,
+                                run.Params.LogprobTokenIds);
                         run.EmitPreview(stepIdx, Sa, argmaxCanvas[a]);
                         if (seqFinished) { finished[a] = true; converged[a] = true; }
                     }
@@ -672,8 +719,9 @@ namespace TensorSharp.Models
                         stepsRun[a]++;
                         // Only the step that emits is reported, so the top-K sweep runs once per read.
                         if (wantLogprobs[a] && (seqFinished || stepsRun[a] >= S))
-                            logprobs[a] = DiffusionLogprobs.TopKPerPosition(
-                                lg, width[a], vocab, run.Params.TopLogprobs);
+                            logprobs[a] = DiffusionLogprobs.PerPosition(
+                                lg, width[a], vocab, run.Params.TopLogprobs,
+                                run.Params.LogprobTokenIds);
                         run.EmitPreview(stepIdx, S, argmaxCanvas[a]);
                         if (seqFinished) { finished[a] = true; converged[a] = true; }
                     }

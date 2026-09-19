@@ -21,6 +21,7 @@ using TensorSharp;
 using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Structured;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -837,6 +838,168 @@ public class DiffusionGemmaTests
 
         Assert.Equal(1, read.ReadResult.StepsRun);
         Assert.True(generation.Response.Count > 0, "the longer request was cut short with the read");
+    }
+
+    // ---- Typed JSON decisions ----------------------------------------------
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void PinnedCanvasPositions_HoldTheirSeedValueForTheWholeDenoise()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        // Pin every other position to a fixed token and let the rest denoise. This is what keeps a
+        // templated canvas's scaffolding intact while its answer slots move.
+        int width = model.CanvasLength;
+        int pinnedToken = model.Tokenizer.Encode("a", addSpecial: false)[0];
+        var seed = new int[width];
+        var pins = new bool[width];
+        for (int i = 0; i < width; i++) { seed[i] = pinnedToken; pins[i] = i % 2 == 0; }
+
+        var p = FixedStepParams(3);
+        new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 3,
+            SeedCanvas = seed,
+            PinnedPositions = pins,
+        }.ApplyTo(p, model.CanvasLength);
+
+        var result = new DiffusionGemmaSampler(model).Read(
+            RenderPrompt(model, "Write a short sentence."), p);
+
+        Assert.Equal(3, result.StepsRun);
+        for (int i = 0; i < width; i++)
+        {
+            if (pins[i]) Assert.Equal(pinnedToken, result.Canvas[i]);
+        }
+        // …and the free half really did denoise: a canvas that came back all-pinned would pass the loop
+        // above while proving nothing.
+        Assert.Contains(Enumerable.Range(0, width).Where(i => !pins[i]),
+            i => result.Canvas[i] != pinnedToken);
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public async Task StructuredDecision_AnswersEveryQuestion_InItsAllowedLanguage()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var reader = new DiffusionGemmaReader(model);
+        var predictor = new StructuredPredictor(reader);
+        var requests = new[]
+        {
+            new StructuredRequest
+            {
+                Id = "refund",
+                Document = "I was charged twice for the same order. Please refund the duplicate.",
+                Questions = new Dictionary<string, StructuredQuestion>
+                {
+                    ["refund_requested"] = StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+                    ["department"] = StructuredQuestion.Choice(
+                        "Which team should handle this?", "billing", "technical", "sales"),
+                },
+            },
+            new StructuredRequest
+            {
+                Id = "outage",
+                Document = "The dashboard has been down for an hour and our demo is at noon.",
+                Questions = new Dictionary<string, StructuredQuestion>
+                {
+                    ["urgent"] = StructuredQuestion.Boolean("Does this need a reply within the hour?"),
+                    ["severity"] = StructuredQuestion.Score("How severe is this?", "low", "medium", "high"),
+                },
+            },
+        };
+
+        var predictions = await predictor.PredictAsync(
+            requests, new StructuredPredictOptions { Steps = 1, Seed = 0, BatchSize = 2 });
+
+        Assert.Equal(2, predictions.Count);
+        foreach (var (request, prediction) in requests.Zip(predictions))
+        {
+            _output.WriteLine($"[diffusion-gemma][structured] {prediction.Id}: {prediction.Json}");
+            Assert.Equal(request.Id, prediction.Id);
+            Assert.Equal(1, prediction.Canvases);
+            // The point of the canvas: the answer is a complete member of the allowed language, always.
+            var json = System.Text.Json.Nodes.JsonNode.Parse(prediction.Json)!.AsObject();
+            Assert.Equal(request.Questions.Keys, json.Select(x => x.Key));
+            foreach (var (key, question) in request.Questions)
+            {
+                object? value = prediction.Values[key];
+                Assert.Contains(question.Options,
+                    o => System.Text.Json.JsonSerializer.Serialize(o)
+                        == System.Text.Json.JsonSerializer.Serialize(value));
+                var answer = prediction.Fields[key];
+                Assert.Equal(question.Options.Count, answer.OptionProbabilities.Count);
+                Assert.Equal(1.0, answer.OptionProbabilities.Sum(), 4);
+                // The reported confidence belongs to the value that was chosen.
+                Assert.Equal(answer.OptionProbabilities.Max(), answer.Probability, 6);
+            }
+        }
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public async Task StructuredBenchmark_ProducesAReceiptWithThroughputAndAccuracy()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var cases = new[]
+        {
+            new StructuredBenchmarkCase
+            {
+                Workflow = "refunds",
+                Request = new StructuredRequest
+                {
+                    Id = "duplicate-charge",
+                    Document = "I was charged twice for the same order. Please refund the duplicate.",
+                    Questions = new Dictionary<string, StructuredQuestion>
+                    {
+                        ["refund_requested"] =
+                            StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+                    },
+                },
+                Expected = new Dictionary<string, object?> { ["refund_requested"] = true },
+            },
+            new StructuredBenchmarkCase
+            {
+                Workflow = "refunds",
+                Request = new StructuredRequest
+                {
+                    Id = "how-to",
+                    Document = "How do I export my invoices as a spreadsheet?",
+                    Questions = new Dictionary<string, StructuredQuestion>
+                    {
+                        ["refund_requested"] =
+                            StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+                    },
+                },
+                Expected = new Dictionary<string, object?> { ["refund_requested"] = false },
+            },
+        };
+
+        var benchmark = new StructuredBenchmark(
+            new StructuredPredictor(new DiffusionGemmaReader(model)));
+        var report = await benchmark.RunAsync(cases, new StructuredBenchmarkOptions
+        {
+            BatchSizes = new[] { 2, 1 },
+            Steps = 1,
+            Repeats = 2,
+            Warmups = 1,
+            DeviceUsdPerSecond = 0.001097,
+            PricingSource = "illustrative; not this machine",
+        });
+
+        _output.WriteLine(report.ToJson());
+        var summary = Assert.Single(report.Summaries);
+        Assert.Equal(4, summary.DocumentsMeasured);
+        Assert.True(summary.DocumentsPerSecond > 0);
+        Assert.Equal(2, summary.Scored);
+        // The same seed on the same documents has to answer the same way twice.
+        Assert.Equal(0, summary.InconsistentRepeatedDocuments);
+        _output.WriteLine($"[diffusion-gemma][structured] accuracy={summary.Accuracy} " +
+            $"docs/s={summary.DocumentsPerSecond:F2}");
     }
 
     /// <summary>Drive two prompts through the batched sampler to completion (block-synchronous, as the

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <IsPackable>true</IsPackable>
+    <Description>Typed JSON decisions on a block-diffusion model: a constrained canvas, a final readout over the allowed tokens, and a benchmark harness for accuracy, throughput and cost.</Description>
+    <PackageTags>$(TensorSharpPackageTags);structured;json;diffusion;classification</PackageTags>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
+    <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+  </ItemGroup>
+</Project>

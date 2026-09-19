@@ -150,6 +150,92 @@ public class DiffusionStructuredReadTests
     }
 
     [Fact]
+    public void PinsNeedSomethingToPinTo_AndMustCoverTheCanvas()
+    {
+        // A pin holds a position at its seed value, so a pin mask without a seed canvas pins to nothing.
+        Assert.Throws<ArgumentException>(() =>
+            Read(x => x.PinnedPositions = new bool[ServedCanvas]).Validate(ServedCanvas, Vocab));
+        Assert.Throws<ArgumentException>(() =>
+            Read(x => { x.SeedCanvas = new int[ServedCanvas]; x.PinnedPositions = new bool[4]; })
+                .Validate(ServedCanvas, Vocab));
+
+        Read(x => { x.SeedCanvas = new int[ServedCanvas]; x.PinnedPositions = new bool[ServedCanvas]; })
+            .Validate(ServedCanvas, Vocab);
+    }
+
+    [Fact]
+    public void RequestedLogprobIdsAreCheckedLikeAnySeed_AndReachTheSampler()
+    {
+        var o = Read(x =>
+        {
+            x.CanvasWidth = 2;
+            x.LogprobTokenIds = new[] { new[] { 1, 2 }, null };
+        });
+        o.Validate(ServedCanvas, Vocab);
+
+        Assert.Throws<ArgumentException>(() => Read(x =>
+        {
+            x.CanvasWidth = 2;
+            x.LogprobTokenIds = new[] { new[] { Vocab } , null };
+        }).Validate(ServedCanvas, Vocab));
+        // One row per canvas position, so a row index IS a position.
+        Assert.Throws<ArgumentException>(() => Read(x =>
+        {
+            x.CanvasWidth = 2;
+            x.LogprobTokenIds = new[] { new[] { 1 } };
+        }).Validate(ServedCanvas, Vocab));
+        Assert.Throws<ArgumentException>(() => Read(x =>
+        {
+            x.ReadOnly = false;
+            x.LogprobTokenIds = new int[ServedCanvas][];
+        }).Validate(ServedCanvas, Vocab));
+
+        var p = new DiffusionEbParams();
+        o.ApplyTo(p, ServedCanvas);
+        Assert.Same(o.LogprobTokenIds, p.LogprobTokenIds);
+    }
+
+    [Fact]
+    public void ScoresFor_ReportsTheAskedTokensInOrder_EvenFarOutsideTheTopK()
+    {
+        // A constrained readout needs the score of an allowed token wherever it ranks, so this asks by id.
+        var logits = new float[Vocab];
+        logits[7] = 10f;
+        var scores = DiffusionLogprobs.ScoresFor(logits, new[] { 300, 7, 42 });
+
+        Assert.Equal(new[] { 300, 7, 42 }, scores.TokenIds);
+        Assert.True(scores.Logprobs[1] > scores.Logprobs[0]);
+        Assert.Equal(scores.Logprobs[0], scores.Logprobs[2], 5);
+        // Same scale as the top-K path: both are log-softmax over the whole vocabulary.
+        Assert.Equal(DiffusionLogprobs.TopK(logits, 1).Logprobs[0], scores.Logprobs[1], 5);
+    }
+
+    [Fact]
+    public void PerPosition_AsksWhereTold_AndRanksWhereNot()
+    {
+        const int vocab = 4;
+        var logits = new float[3 * vocab];
+        logits[0 * vocab + 3] = 5f;
+        logits[1 * vocab + 1] = 5f;
+        logits[2 * vocab + 2] = 5f;
+
+        var perPos = DiffusionLogprobs.PerPosition(
+            logits, width: 3, vocab: vocab, k: 2,
+            requested: new[] { new[] { 0, 3 }, null, Array.Empty<int>() });
+
+        Assert.Equal(new[] { 0, 3 }, perPos[0].TokenIds);   // asked for: exactly these, in order
+        Assert.Equal(1, perPos[1].TokenIds[0]);             // not asked: the position's own top-k
+        Assert.Equal(2, perPos[1].TokenIds.Length);
+        Assert.Equal(2, perPos[2].TokenIds[0]);             // an empty row is not a request
+
+        // With no top-k either, a position nobody asked about reports nothing.
+        var none = DiffusionLogprobs.PerPosition(
+            logits, 3, vocab, k: 0, requested: new[] { new[] { 1 }, null, null });
+        Assert.Single(none[0].TokenIds);
+        Assert.Empty(none[1].TokenIds);
+    }
+
+    [Fact]
     public void TopK_SumsToOne_OverTheWholeVocabulary()
     {
         var rng = new Random(7);

@@ -316,6 +316,48 @@ match its width would read back different slots than the caller wrote. The
 response is a `diffusion.read` object: the canvas as tokens and decoded text,
 `steps`, `converged`, and a `logprobs` array of `{position, top_logprobs}`.
 
+## 6b. Typed JSON decisions
+
+A read whose canvas is a JSON *template* turns the model into a classifier.
+Tokenize every allowed answer as a complete JSON document, pin the token
+positions all of them agree on - the braces, the quoted keys, the separators -
+and leave free only the positions where they differ. One denoise step later,
+the scores at those free positions choose among the allowed tokens, and the
+answer is a complete member of the allowed language by construction: no JSON
+repair, no retry, no second pass.
+
+[`TensorSharp.Structured`](../../TensorSharp.Structured/README.md) is that
+layer, with a benchmark harness for accuracy, throughput and cost. Its
+construction follows [open-jev](https://github.com/theolivenbaum/open-jev), the
+Python research harness for the same idea on this model, and its benchmark
+receipts use open-jev's field names so runs can be put side by side.
+
+```csharp
+var predictor = new StructuredPredictor(new DiffusionGemmaReader(model));
+StructuredPrediction answer = await predictor.PredictAsync(new StructuredRequest
+{
+    Document = "I was charged twice. Please refund the duplicate.",
+    Questions = new Dictionary<string, StructuredQuestion>
+    {
+        ["refund_requested"] = StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+        ["department"] = StructuredQuestion.Choice("Which team?", "billing", "technical", "sales"),
+    },
+});
+```
+
+Two read fields exist for it, on top of the structured-read contract above:
+
+| field | meaning |
+|---|---|
+| `PinnedPositions` | canvas positions held at their seed value for the whole denoise. A pinned position contributes no entropy and settles immediately - the cheap form of a logits mask allowing exactly one token there. Free positions denoise unrestricted. |
+| `LogprobTokenIds` | per position, the token ids to report the score of, instead of that position's top-K. A constrained readout needs the score of every *allowed* token at a slot, and an allowed token can sit far outside any top-K. |
+
+Where open-jev applies a `[canvas, vocab]` logits mask each step, TensorSharp
+pins positions: the same effect where it matters, without materializing the
+mask. Questions on one canvas share attention, and a question set too large for
+one canvas is split and merged - so this does not isolate questions from one
+another.
+
 ## 7. Test coverage
 
 [`DiffusionGemmaTests`](../../InferenceWeb.Tests/DiffusionGemmaTests.cs) is
@@ -330,11 +372,19 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
 - Structured reads: the emitted canvas and its per-position distribution, the
   read's equivalence between the single-request and batched paths, and the
   per-request step cap in a batch with a longer generation.
+- Typed JSON decisions: pinned positions holding through a multi-step denoise,
+  a prediction in its allowed language, and a benchmark receipt.
 
 [`DiffusionStructuredReadTests`](../../InferenceWeb.Tests/DiffusionStructuredReadTests.cs)
 needs no checkpoint and runs in ordinary CI: what a read is allowed to ask for
 (and the refusals), what it does to the sampler parameters, and the temperature-1
 top-K itself.
+
+[`StructuredDecisionTests`](../../InferenceWeb.Tests/StructuredDecisionTests.cs)
+also runs without a checkpoint: a character tokenizer compiles the canvases for
+real, and a scripted reader stands in for the denoise, so the canvas, the
+constrained readout, the canvas packing and the benchmark harness are exercised
+on their own terms.
 
 ## 8. Remaining work
 

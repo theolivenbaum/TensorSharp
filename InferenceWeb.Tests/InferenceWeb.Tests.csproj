@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -36,6 +36,7 @@
     <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
     <ProjectReference Include="..\TensorSharp.Chat\TensorSharp.Chat.csproj" />
     <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
+    <ProjectReference Include="..\TensorSharp.Structured\TensorSharp.Structured.csproj" />
     <ProjectReference Include="..\TensorSharp.Server.Host\TensorSharp.Server.Host.csproj" />
     <ProjectReference Include="..\TensorSharp.Cli\TensorSharp.Cli.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
