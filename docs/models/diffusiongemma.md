@@ -338,6 +338,14 @@ construction follows [open-jev](https://github.com/theolivenbaum/open-jev), the
 Python research harness for the same idea on this model, and its benchmark
 receipts use open-jev's field names so runs can be put side by side.
 
+`OpenJevEvalSet` reads open-jev's public evaluation materials straight into
+benchmark cases, resolving references the way open-jev does, so the same
+questions can be replayed here. The data is third-party and is not vendored:
+point the loader at a checkout. The importer reproduces open-jev's published
+shape exactly - 408 questions, 337 scorable, 54 without a reference, 17 tied,
+and its saved baseline at 90.8% - which is what makes a receipt produced here
+comparable to one produced there.
+
 ```csharp
 var predictor = new StructuredPredictor(new DiffusionGemmaReader(model));
 StructuredPrediction answer = await predictor.PredictAsync(new StructuredRequest
@@ -388,6 +396,12 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
 - A narrow canvas costing less than the served one, which is the whole point of
   a per-request width.
 
+[`OpenJevEvalSetTests`](../../InferenceWeb.Tests/OpenJevEvalSetTests.cs) replays
+open-jev's public evaluation set from a checkout named by `TS_OPEN_JEV_DIR`,
+pinning the importer against that project's published question counts and
+baseline accuracy; its last case needs a checkpoint too and produces a
+comparable receipt.
+
 [`DiffusionStructuredReadTests`](../../InferenceWeb.Tests/DiffusionStructuredReadTests.cs)
 needs no checkpoint and runs in ordinary CI: what a read is allowed to ask for
 (and the refusals), what it does to the sampler parameters, and the temperature-1
@@ -405,7 +419,8 @@ on their own terms.
   compatibility surface.
 - Publish an accuracy comparison between a tight canvas and the served one on a
   real checkpoint, so `diffusion_canvas_length` can be recommended rather than
-  only offered.
+  only offered. `OpenJevEvalSet` plus `StructuredBenchmarkOptions.CanvasFit` is
+  the harness for it; what is missing is a GPU run.
 - Promote true batched canvas decode only if it wins on target GPUs; today the
   fused single-canvas path can be faster when one canvas already saturates the
   GPU.

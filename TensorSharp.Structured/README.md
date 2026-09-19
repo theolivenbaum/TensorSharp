@@ -99,6 +99,40 @@ The receipt's field names match [open-jev](https://github.com/theolivenbaum/open
 Read `cost_scope` before quoting a dollar figure: it is device time over the timed passes
 only, and not an invoice.
 
+Accuracy accounts for every question asked, not just the ones it could score.
+`StructuredBenchmarkCase.Unscored` carries why a question has no reference, and the receipt
+reports the counts: a dataset where some questions were never adjudicated, or where the
+adjudicators tied, is not the same as one where they all agree, and `scored` plus `unscored`
+has to add up to the questions asked. `Baseline` carries another system's answers and is
+scored on exactly the same questions — a comparison between two systems measured on
+different subsets is not one.
+
+## Evaluating against open-jev's public set
+
+open-jev ships the public evaluation materials it measured on. `OpenJevEvalSet` reads them
+into benchmark cases, resolving references the same way open-jev does — the consensus of a
+question's adjudication sets, averaged, scored only where one value leads outright:
+
+```csharp
+var set = OpenJevEvalSet.Load("/path/to/open-jev");
+var report = await new StructuredBenchmark(predictor).RunAsync(set.Cases);
+```
+
+The data is **not vendored here**. It is third-party evaluation material with its own
+rights, published with source URLs and hashes in open-jev's `manifest.json`; point the
+loader at a checkout. `SourceSha256` records what was actually read, so a receipt can name
+its inputs.
+
+As a check that the two agree on what is being measured, the importer reproduces open-jev's
+published shape exactly: 408 questions, 337 scorable, 54 without a reference, 17 tied, and
+its saved baseline at 90.8% overall (78.8 / 89.1 / 97.0 / 80.8 by workflow). `OpenJevEvalSetTests`
+asserts those numbers against a checkout named by `TS_OPEN_JEV_DIR`.
+
+One difference to know about: open-jev puts a question's criteria into the prompt as the raw
+JSON the dataset stores (a `{label: description}` object, or a list for a score). This
+library aligns `Criteria` with `Options` and prints them as parallel arrays, so the prompts
+are worded differently even though the allowed values are identical.
+
 ## Relationship to open-jev
 
 open-jev is the Python research harness for this idea on DiffusionGemma. This library is

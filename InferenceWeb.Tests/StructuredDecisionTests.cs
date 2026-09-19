@@ -545,6 +545,79 @@ public class StructuredDecisionTests
     }
 
     [Fact]
+    public async Task QuestionsWithNoUsableReferenceAreCounted_NotQuietlyDropped()
+    {
+        // A dataset where some questions were never adjudicated, or where the adjudicators tied, is not
+        // the same as one where they all agree - so the receipt has to account for every question asked,
+        // or its accuracy is over a subset nobody can see.
+        var cases = new[]
+        {
+            new StructuredBenchmarkCase
+            {
+                Request = Request("mixed",
+                    ("a", StructuredQuestion.Boolean("Urgent?")),
+                    ("b", StructuredQuestion.Boolean("Urgent?")),
+                    ("c", StructuredQuestion.Boolean("Urgent?"))),
+                Expected = new Dictionary<string, object?> { ["a"] = true },
+                Unscored = new Dictionary<string, string>
+                {
+                    ["b"] = "missing_reference",
+                    ["c"] = "reference_tie",
+                },
+            },
+        };
+
+        StructuredBenchmarkReport report = await Benchmark().RunAsync(cases,
+            new StructuredBenchmarkOptions { BatchSizes = new[] { 2 }, Repeats = 1, Warmups = 0 });
+
+        StructuredBenchmarkSummary summary = Assert.Single(report.Summaries);
+        Assert.Equal(1, summary.Scored);
+        Assert.Equal(1, summary.Unscored["missing_reference"]);
+        Assert.Equal(1, summary.Unscored["reference_tie"]);
+        // Scored plus unscored is every question asked.
+        Assert.Equal(3, summary.Scored + summary.Unscored.Values.Sum());
+        // No baseline was supplied, so the receipt claims nothing about one.
+        Assert.Null(summary.BaselineCorrect);
+        Assert.Null(summary.AgreementWithBaseline);
+    }
+
+    [Fact]
+    public async Task ABaselineIsScoredOnExactlyTheQuestionsThisRunWasScoredOn()
+    {
+        // Comparing two systems measured on different subsets is not a comparison. The reader answers
+        // true throughout; the baseline is right on "a" and wrong on "b", and disagrees on "b".
+        var cases = new[]
+        {
+            new StructuredBenchmarkCase
+            {
+                Request = Request("compare",
+                    ("a", StructuredQuestion.Boolean("Urgent?")),
+                    ("b", StructuredQuestion.Boolean("Urgent?")),
+                    ("c", StructuredQuestion.Boolean("Urgent?"))),
+                Expected = new Dictionary<string, object?> { ["a"] = true, ["b"] = true },
+                Unscored = new Dictionary<string, string> { ["c"] = "missing_reference" },
+                Baseline = new Dictionary<string, object?>
+                {
+                    ["a"] = true,
+                    ["b"] = false,
+                    ["c"] = false,   // unscored here too, so it must not reach any total
+                },
+            },
+        };
+
+        StructuredBenchmarkReport report = await Benchmark().RunAsync(cases,
+            new StructuredBenchmarkOptions { BatchSizes = new[] { 2 }, Repeats = 1, Warmups = 0 });
+
+        StructuredBenchmarkSummary summary = Assert.Single(report.Summaries);
+        Assert.Equal(2, summary.Scored);
+        Assert.Equal(2, summary.Correct);
+        Assert.Equal(1, summary.BaselineCorrect);
+        Assert.Equal(0.5, summary.BaselineAccuracy!.Value, 6);
+        Assert.Equal(0.5, summary.AgreementWithBaseline!.Value, 6);
+        Assert.Equal(0.5, summary.ByWorkflow["all"].BaselineAccuracy!.Value, 6);
+    }
+
+    [Fact]
     public async Task TheSweepHalvesPastABatchTheDeviceCannotHold_AndSaysSo()
     {
         // Anything wider than two canvases runs the (pretend) device out of memory.

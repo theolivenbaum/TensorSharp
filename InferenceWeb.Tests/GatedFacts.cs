@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -107,6 +107,21 @@ namespace InferenceWeb.Tests
         /// name a file or a directory; with <paramref name="ggufContains"/> the
         /// directory must hold a matching GGUF (see <see cref="FindGguf"/>).
         /// </summary>
+        /// <summary>
+        /// Skip reason for a test that replays a third-party evaluation set. The data carries its own
+        /// rights and is not vendored here, so the test points at a checkout named by an environment
+        /// variable and skips visibly when there is not one.
+        /// </summary>
+        public static string EvalDataSkip(string envVar, string what)
+        {
+            string value = Environment.GetEnvironmentVariable(envVar);
+            if (string.IsNullOrEmpty(value))
+                return $"Requires {what} ({envVar} not set).";
+            if (!Directory.Exists(value))
+                return $"Requires {what} ({envVar} points to a missing directory).";
+            return null;
+        }
+
         public static string ModelSkip(string envVar, string ggufContains = null)
         {
             string value = Environment.GetEnvironmentVariable(envVar);
@@ -308,6 +323,36 @@ namespace InferenceWeb.Tests
         public string RequiresValue => "Video";
 
         public VideoTheoryAttribute() => Skip = TestGates.VideoSkip;
+    }
+
+    /// <summary>
+    /// [Fact] that replays a third-party evaluation set from a checkout the environment points at:
+    /// skips visibly when it is not there, and carries Requires=EvalData.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class EvalDataFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "EvalData";
+
+        public EvalDataFactAttribute(string envVar, string what)
+            => Skip = TestGates.EvalDataSkip(envVar, what);
+    }
+
+    /// <summary>
+    /// [Fact] that replays a third-party evaluation set through a real model, so it needs both the data
+    /// and the weights. Skips naming whichever is missing, and carries Requires=Models.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class EvalDataModelFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Models";
+
+        public EvalDataModelFactAttribute(
+            string evalEnvVar, string what, string modelEnvVar, string ggufContains = null)
+            => Skip = TestGates.EvalDataSkip(evalEnvVar, what)
+                ?? TestGates.ModelSkip(modelEnvVar, ggufContains);
     }
 
     /// <summary>

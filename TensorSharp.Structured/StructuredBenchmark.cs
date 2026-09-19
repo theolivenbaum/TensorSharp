@@ -28,6 +28,20 @@ namespace TensorSharp.Structured
         public IReadOnlyDictionary<string, object?> Expected { get; init; } =
             new Dictionary<string, object?>();
 
+        /// <summary>
+        /// Why a question has no reference, by key: a dataset where some questions were never
+        /// adjudicated, or where the adjudicators tied, is not the same as one where they all agree.
+        /// Counted in the receipt so the scored total is auditable rather than a silent subset.
+        /// </summary>
+        public IReadOnlyDictionary<string, string> Unscored { get; init; } =
+            new Dictionary<string, string>();
+
+        /// <summary>Another system's answers on the same questions, by key. Scored alongside, so a
+        /// receipt says how the run did AND how the system it is being compared to did on exactly the
+        /// same subset.</summary>
+        public IReadOnlyDictionary<string, object?> Baseline { get; init; } =
+            new Dictionary<string, object?>();
+
         /// <summary>Groups cases in the report (a workflow, a dataset, an experiment).</summary>
         public string Workflow { get; init; } = "all";
     }
@@ -91,6 +105,17 @@ namespace TensorSharp.Structured
         [JsonPropertyName("scored")] public required int Scored { get; init; }
         [JsonPropertyName("correct")] public required int Correct { get; init; }
         [JsonPropertyName("accuracy")] public required double? Accuracy { get; init; }
+
+        /// <summary>Questions with no usable reference, by reason. Scored + these is every question asked.</summary>
+        [JsonPropertyName("unscored")] public required IReadOnlyDictionary<string, int> Unscored { get; init; }
+
+        /// <summary>How the compared system did on the same scored questions, when one was supplied.</summary>
+        [JsonPropertyName("baseline_correct")] public required int? BaselineCorrect { get; init; }
+        [JsonPropertyName("baseline_accuracy")] public required double? BaselineAccuracy { get; init; }
+
+        /// <summary>How often this run and the compared system gave the same answer, right or wrong.</summary>
+        [JsonPropertyName("agreement_with_baseline")] public required double? AgreementWithBaseline { get; init; }
+
         [JsonPropertyName("by_workflow")] public required IReadOnlyDictionary<string, WorkflowScore> ByWorkflow { get; init; }
     }
 
@@ -100,6 +125,8 @@ namespace TensorSharp.Structured
         [JsonPropertyName("scored")] public required int Scored { get; init; }
         [JsonPropertyName("correct")] public required int Correct { get; init; }
         [JsonPropertyName("accuracy")] public required double? Accuracy { get; init; }
+        [JsonPropertyName("baseline_correct")] public required int? BaselineCorrect { get; init; }
+        [JsonPropertyName("baseline_accuracy")] public required double? BaselineAccuracy { get; init; }
     }
 
     /// <summary>A batch size that did not fit, and what it said on the way out.</summary>
@@ -265,7 +292,7 @@ namespace TensorSharp.Structured
                 if (passes.Any(pass => pass[i].Json != first)) inconsistent++;
             }
 
-            (int scored, int correct, Dictionary<string, WorkflowScore> byWorkflow) = Score(cases, passes[0]);
+            Scoreboard board = Score(cases, passes[0]);
 
             return new StructuredBenchmarkSummary
             {
@@ -282,39 +309,84 @@ namespace TensorSharp.Structured
                 UsdPer1000Judgments = usd is { } v ? 1000 * v / judgments : null,
                 ValidAnswers = passes.Sum(pass => pass.Sum(p => p.Fields.Count)),
                 InconsistentRepeatedDocuments = inconsistent,
-                Scored = scored,
-                Correct = correct,
-                Accuracy = scored > 0 ? (double)correct / scored : null,
-                ByWorkflow = byWorkflow,
+                Scored = board.Scored,
+                Correct = board.Correct,
+                Accuracy = board.Scored > 0 ? (double)board.Correct / board.Scored : null,
+                Unscored = board.Unscored,
+                BaselineCorrect = board.HasBaseline ? board.BaselineCorrect : null,
+                BaselineAccuracy = board.HasBaseline && board.Scored > 0
+                    ? (double)board.BaselineCorrect / board.Scored : null,
+                AgreementWithBaseline = board.HasBaseline && board.Scored > 0
+                    ? (double)board.Agreed / board.Scored : null,
+                ByWorkflow = board.ByWorkflow,
             };
         }
 
-        /// <summary>Compare one pass against the references. A question with no reference is not scored;
-        /// scoring the first timed pass keeps the number independent of how many passes were run.</summary>
-        private static (int Scored, int Correct, Dictionary<string, WorkflowScore> ByWorkflow) Score(
+        /// <summary>Running totals while a pass is compared against its references.</summary>
+        private sealed record Scoreboard(
+            int Scored,
+            int Correct,
+            int BaselineCorrect,
+            int Agreed,
+            bool HasBaseline,
+            IReadOnlyDictionary<string, int> Unscored,
+            IReadOnlyDictionary<string, WorkflowScore> ByWorkflow);
+
+        /// <summary>
+        /// Compare one pass against the references. A question with no reference is not scored but is
+        /// counted under why, so the scored total can be audited against the questions asked rather than
+        /// being a silent subset. Where a baseline was supplied it is scored on exactly the same
+        /// questions - a comparison between two systems measured on different subsets is not one.
+        /// Scoring the first timed pass keeps the number independent of how many passes were run.
+        /// </summary>
+        private static Scoreboard Score(
             IReadOnlyList<StructuredBenchmarkCase> cases, IReadOnlyList<StructuredPrediction> predictions)
         {
             var scored = new Dictionary<string, int>();
             var correct = new Dictionary<string, int>();
+            var baselineCorrect = new Dictionary<string, int>();
+            var unscored = new Dictionary<string, int>();
+            int agreed = 0;
+            bool hasBaseline = false;
+
             for (int i = 0; i < cases.Count; i++)
             {
                 StructuredBenchmarkCase benchmarkCase = cases[i];
+                string workflow = benchmarkCase.Workflow;
                 foreach ((string key, StructuredFieldAnswer answer) in predictions[i].Fields)
                 {
-                    if (!benchmarkCase.Expected.TryGetValue(key, out object? expected)) continue;
-                    string workflow = benchmarkCase.Workflow;
+                    if (!benchmarkCase.Expected.TryGetValue(key, out object? expected))
+                    {
+                        string reason = benchmarkCase.Unscored.GetValueOrDefault(key, "no_reference");
+                        unscored[reason] = unscored.GetValueOrDefault(reason) + 1;
+                        continue;
+                    }
                     scored[workflow] = scored.GetValueOrDefault(workflow) + 1;
-                    if (JsonValue.Serialize(expected) == JsonValue.Serialize(answer.Value))
+                    string ours = JsonValue.Serialize(answer.Value);
+                    if (ours == JsonValue.Serialize(expected))
                         correct[workflow] = correct.GetValueOrDefault(workflow) + 1;
+
+                    if (!benchmarkCase.Baseline.TryGetValue(key, out object? baseline)) continue;
+                    hasBaseline = true;
+                    string theirs = JsonValue.Serialize(baseline);
+                    if (theirs == JsonValue.Serialize(expected))
+                        baselineCorrect[workflow] = baselineCorrect.GetValueOrDefault(workflow) + 1;
+                    if (theirs == ours) agreed++;
                 }
             }
+
             var byWorkflow = scored.ToDictionary(kv => kv.Key, kv => new WorkflowScore
             {
                 Scored = kv.Value,
                 Correct = correct.GetValueOrDefault(kv.Key),
                 Accuracy = kv.Value > 0 ? (double)correct.GetValueOrDefault(kv.Key) / kv.Value : null,
+                BaselineCorrect = hasBaseline ? baselineCorrect.GetValueOrDefault(kv.Key) : null,
+                BaselineAccuracy = hasBaseline && kv.Value > 0
+                    ? (double)baselineCorrect.GetValueOrDefault(kv.Key) / kv.Value : null,
             });
-            return (scored.Values.Sum(), correct.Values.Sum(), byWorkflow);
+            return new Scoreboard(
+                scored.Values.Sum(), correct.Values.Sum(), baselineCorrect.Values.Sum(), agreed,
+                hasBaseline, unscored, byWorkflow);
         }
 
         private static IReadOnlyList<int> ActualBatches(int canvases, int batchSize)
