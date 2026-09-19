@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -35,6 +35,12 @@ public static class OpenAIEndpoints
             (HttpContext ctx, OpenAIResponsesAdapter adapter) => adapter.CreateResponseAsync(ctx));
         endpoints.MapGet("/v1/responses/{id}",
             (HttpContext ctx, OpenAIResponsesAdapter adapter, string id) => adapter.GetResponseAsync(ctx, id));
+        // Structured reads on a block-diffusion model: a seeded canvas denoised for a bounded number of
+        // steps, answered with the model's distribution over every canvas position. Chat completions
+        // cannot carry this - there is no continuation and no finish reason, only per-position logprobs.
+        endpoints.MapPost("/v1/diffusion/read",
+            (HttpContext ctx, DiffusionReadAdapter adapter) => adapter.ReadAsync(ctx))
+            .DisableRequestTimeout();
         // Text-to-video generation (Wan models). OpenAI has no stable public video
         // API yet; this follows the images/generations envelope: prompt in, a data
         // array with url and (optionally) b64_json out.

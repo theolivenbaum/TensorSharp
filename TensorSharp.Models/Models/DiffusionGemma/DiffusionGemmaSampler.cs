@@ -28,6 +28,24 @@ namespace TensorSharp.Models
         public float ConfidenceThreshold = 0.005f; // stop once mean canvas entropy drops below this
         public int Seed = 0;
         public int MaxBlocks = 1;            // block-autoregressive blocks (each = canvas_length tokens)
+
+        // --- Structured reads (see DiffusionReadOptions) ---
+
+        /// <summary>Token ids that replace the random initial canvas of the first block, exactly
+        /// <see cref="CanvasWidth"/> long. Null keeps the random canvas.</summary>
+        public int[] SeedCanvas = null;
+
+        /// <summary>The leading canvas positions this request owns; 0 means the whole served canvas.
+        /// The model forward is fixed-width, so the tail beyond this is still denoised - it is simply
+        /// not part of the request's canvas, and neither converges it nor is emitted.</summary>
+        public int CanvasWidth = 0;
+
+        /// <summary>Emit the argmax canvas as soon as the step cap (or convergence) is reached and end
+        /// there: one canvas is the whole output, with no end-of-turn trimming.</summary>
+        public bool ReadOnly = false;
+
+        /// <summary>Top tokens to report per canvas position, at temperature 1. Read-only only.</summary>
+        public int TopLogprobs = 0;
     }
 
     /// <summary>
@@ -100,7 +118,9 @@ namespace TensorSharp.Models
             {
                 if (ct.IsCancellationRequested) break;
                 int bIdx = b;
-                int[] canvas = DenoiseBlock(prefix.ToArray(), p,
+                // A seed canvas describes the answer being read, so it belongs to the first block only;
+                // later blocks continue from the committed prefix on a random canvas as usual.
+                int[] canvas = DenoiseBlockCore(prefix.ToArray(), p, applySeed: b == 0,
                     blockStepCallback == null ? null : (step, total, argmax) =>
                     {
                         var preview = new int[response.Count + argmax.Length];
@@ -108,7 +128,7 @@ namespace TensorSharp.Models
                         argmax.CopyTo(preview, response.Count);
                         blockStepCallback(bIdx, step, total, preview);
                     },
-                    ct);
+                    ct).Canvas;
 
                 int cut = TrimCanvas(canvas, canvas.Length);
                 for (int i = 0; i < cut; i++) response.Add(canvas[i]);
@@ -119,13 +139,41 @@ namespace TensorSharp.Models
             return response;
         }
 
+        /// <summary>The canvas positions a request owns: its own width, else the served canvas.</summary>
+        private int WidthOf(DiffusionEbParams p) =>
+            p.CanvasWidth > 0 ? Math.Min(p.CanvasWidth, _canvasLength) : _canvasLength;
+
         /// <summary>Denoise a single block of <c>canvas_length</c> tokens. Returns the argmax canvas.
         /// <paramref name="stepCallback"/> receives (step, totalSteps, argmaxCanvasSnapshot) each step.</summary>
         public int[] DenoiseBlock(int[] promptTokens, DiffusionEbParams p,
             Action<int, int, int[]> stepCallback = null, CancellationToken ct = default)
+            => DenoiseBlockCore(promptTokens, p, applySeed: true, stepCallback, ct).Canvas;
+
+        /// <summary>
+        /// Perform a structured read: denoise the seeded canvas for at most
+        /// <see cref="DiffusionEbParams.MaxDenoisingSteps"/> steps and return the canvas the model settled
+        /// on, untrimmed, together with the temperature-1 distribution at every position when
+        /// <see cref="DiffusionEbParams.TopLogprobs"/> asks for one. The canvas IS the answer, so nothing
+        /// is cut at an end-of-turn token and no second block is generated.
+        /// </summary>
+        public DiffusionReadResult Read(int[] promptTokens, DiffusionEbParams p,
+            Action<int, int, int[]> stepCallback = null, CancellationToken ct = default)
+        {
+            if (p == null) throw new ArgumentNullException(nameof(p));
+            if (!p.ReadOnly)
+                throw new ArgumentException("A read needs DiffusionEbParams.ReadOnly set.", nameof(p));
+            return DenoiseBlockCore(promptTokens, p, applySeed: true, stepCallback, ct);
+        }
+
+        /// <summary>Denoise one block and report everything a structured read needs: the emitted canvas,
+        /// the steps it took, whether it converged, and - for a read asking for them - the temperature-1
+        /// distributions of the step that emitted.</summary>
+        private DiffusionReadResult DenoiseBlockCore(int[] promptTokens, DiffusionEbParams p, bool applySeed,
+            Action<int, int, int[]> stepCallback, CancellationToken ct)
         {
             int P = promptTokens.Length;
             int C = _canvasLength;
+            int W = WidthOf(p);
             int S = Math.Max(1, p.MaxDenoisingSteps);
             int vocab = _vocab;
 
@@ -133,6 +181,7 @@ namespace TensorSharp.Models
 
             int[] currentCanvas = new int[C];
             for (int i = 0; i < C; i++) currentCanvas[i] = rng.NextInt(vocab);
+            if (applySeed) ApplySeedCanvas(p, currentCanvas, W);
 
             // Self-conditioning reads the PREVIOUS step's logits. The model reads scBuffer at the START of
             // the forward (before it overwrites/produces the new logits), so we can hand it the previous
@@ -140,9 +189,9 @@ namespace TensorSharp.Models
             // Both paths return a reusable buffer (fused: _fusedLogitsBuffer, per-op: _canvasLogits) that
             // is only overwritten at the END of the forward — after SC has read it — so the alias is safe.
             float[] scBuffer = null;
-            int[] argmaxCanvas = new int[C];
-            int[] prevArgmax = new int[C];
-            for (int i = 0; i < C; i++) prevArgmax[i] = -1;
+            int[] argmaxCanvas = new int[W];
+            int[] prevArgmax = new int[W];
+            for (int i = 0; i < W; i++) prevArgmax[i] = -1;
 
             float[] entropy = new float[C];
             int[] denoiser = new int[C];
@@ -164,11 +213,16 @@ namespace TensorSharp.Models
                 Array.Copy(promptTokens, tokens, P);
             }
 
+            // A read reports the distribution itself, which only the full logits carry. The on-device
+            // sampler returns a top-K taken at the step's temperature, so such a request stays on the host
+            // logits path - one readback per step, over the handful of steps a read runs.
+            bool wantLogprobs = p.ReadOnly && p.TopLogprobs > 0;
+
             // On-device sampling (CUDA): the lm_head kernel returns argmax/entropy/sampled/top-K directly,
             // so the full [vocab,C] logits never cross PCIe and no host full-vocab CPU sweep runs. Needs the
             // prompt-KV decode path (its canvas hidden stays on-device for the sampling tail). The per-step
             // top-K (double-buffered) feeds the NEXT step's self-conditioning, replacing the host logits.
-            bool useDeviceSample = usePkv && _model.SupportsDeviceSampling;
+            bool useDeviceSample = usePkv && _model.SupportsDeviceSampling && !wantLogprobs;
             int K = _model.SelfCondTopK;
             int[] dArg = null, dSamp = null;
             int[][] topTok = null; float[][] topPrb = null; int dbuf = 0;
@@ -183,6 +237,8 @@ namespace TensorSharp.Models
             float prevTempInv = 1f;
             int held = 0;
             bool finished = false;
+            int stepsRun = 0;
+            DiffusionPositionLogprobs[] logprobs = null;
 
             for (int curStep = S; curStep >= 1 && !finished && !ct.IsCancellationRequested; curStep--)
             {
@@ -203,9 +259,10 @@ namespace TensorSharp.Models
                     if (ok)
                     {
                         finished = DenoiseStepFromDevice(dArg, entropy, dSamp, renoise, p,
-                            currentCanvas, argmaxCanvas, prevArgmax, ref held, order);
+                            currentCanvas, argmaxCanvas, prevArgmax, ref held, order, W);
                         dbuf ^= 1;
                         prevTempInv = tempInv;
+                        stepsRun++;
                         stepCallback?.Invoke(stepIdx, S, (int[])argmaxCanvas.Clone());
                         continue;
                     }
@@ -228,8 +285,14 @@ namespace TensorSharp.Models
 
                 // per-position sampling + accept + renoise + adaptive-stop (shared with the batched path)
                 finished = DenoiseStep(logits, tempInv, rng, p, currentCanvas, argmaxCanvas, prevArgmax,
-                    ref held, entropy, denoiser, order, u, renoise);
+                    ref held, entropy, denoiser, order, u, renoise, W);
                 prevTempInv = tempInv;
+                stepsRun++;
+
+                // Only the step that emits is reported, so the top-K sweep runs once per read rather than
+                // once per step. These logits are still this step's; the next forward overwrites them.
+                if (wantLogprobs && (finished || curStep == 1))
+                    logprobs = DiffusionLogprobs.TopKPerPosition(logits, W, vocab, p.TopLogprobs);
 
                 // hand this step's logits to the next step's self-conditioning (no copy; see scBuffer note)
                 if (_model.SelfConditioningEnabled) scBuffer = logits;
@@ -237,7 +300,19 @@ namespace TensorSharp.Models
                 stepCallback?.Invoke(stepIdx, S, (int[])argmaxCanvas.Clone());
             }
 
-            return (int[])argmaxCanvas.Clone();
+            return new DiffusionReadResult((int[])argmaxCanvas.Clone(), logprobs, stepsRun, finished);
+        }
+
+        /// <summary>Overwrite the request's canvas positions with its seed ids. The tail past
+        /// <paramref name="width"/> keeps its noise: it is outside the request's canvas.</summary>
+        private static void ApplySeedCanvas(DiffusionEbParams p, int[] canvas, int width)
+        {
+            int[] seed = p.SeedCanvas;
+            if (seed == null) return;
+            if (seed.Length != width)
+                throw new ArgumentException(
+                    $"SeedCanvas must hold exactly {width} ids, got {seed.Length}.", nameof(p));
+            Array.Copy(seed, canvas, width);
         }
 
         /// <summary>One denoising step's host-side work, shared by the single-request <see cref="DenoiseBlock"/>
@@ -250,9 +325,10 @@ namespace TensorSharp.Models
         /// <paramref name="held"/>. The scratch arrays are caller-owned to keep the hot loop allocation-light.</summary>
         private bool DenoiseStep(float[] logits, float tempInv, DeterministicRng rng, DiffusionEbParams p,
             int[] currentCanvas, int[] argmaxCanvas, int[] prevArgmax, ref int held,
-            float[] entropy, int[] denoiser, int[] order, float[] u, int[] renoise)
+            float[] entropy, int[] denoiser, int[] order, float[] u, int[] renoise, int width)
         {
             int C = _canvasLength;
+            int W = width;
             int vocab = _vocab;
 
             // pre-draw step randomness (single-threaded) for reproducibility
@@ -269,7 +345,7 @@ namespace TensorSharp.Models
             //     = ln Z + m - (Σ e·s)/Z
             //   sample = first v with cumulative Σe >= u*Z (the same CDF-inverse draw as the scalar
             //   reference, over the same token ordering).
-            Parallel.For(0, C,
+            Parallel.For(0, W,
                 () => (scaled: new float[vocab], exps: new float[vocab]),
                 (pos, _, scratch) =>
                 {
@@ -299,32 +375,49 @@ namespace TensorSharp.Models
                 },
                 _ => { });
 
-            // accept lowest-entropy positions within the MI bound (sum of strictly-earlier entropies <= bound)
-            for (int i = 0; i < C; i++) order[i] = i;
-            Array.Sort(order, (a, bb) => entropy[a].CompareTo(entropy[bb]));
-            var accepted = new bool[C];
-            double cumE = 0.0;
-            for (int kk = 0; kk < C; kk++)
-            {
-                int pos = order[kk];
-                cumE += entropy[pos];
-                if (cumE - entropy[pos] <= p.EntropyBound) accepted[pos] = true;
-            }
+            var accepted = AcceptLowestEntropy(entropy, order, W, p.EntropyBound);
 
             // renoise: accepted -> sampled token, rest -> fresh random; output = argmax canvas
             float entropySum = 0f;
-            for (int pos = 0; pos < C; pos++)
+            for (int pos = 0; pos < W; pos++)
             {
                 currentCanvas[pos] = accepted[pos] ? denoiser[pos] : renoise[pos];
                 entropySum += entropy[pos];
             }
+            // Positions past the request's canvas are not its answer: they stay noise so nothing the model
+            // writes there can settle and read back as content.
+            for (int pos = W; pos < C; pos++) currentCanvas[pos] = renoise[pos];
 
-            // adaptive stop: argmax stable for StabilityThreshold steps AND confident (low mean entropy)
+            return AdaptiveStop(argmaxCanvas, prevArgmax, ref held, entropySum, W, p);
+        }
+
+        /// <summary>Accept the lowest-entropy canvas positions whose cumulative mutual information stays
+        /// within <paramref name="entropyBound"/> (the sum of strictly-earlier entropies).</summary>
+        private static bool[] AcceptLowestEntropy(float[] entropy, int[] order, int width, float entropyBound)
+        {
+            for (int i = 0; i < width; i++) order[i] = i;
+            Array.Sort(order, 0, width, Comparer<int>.Create((a, b) => entropy[a].CompareTo(entropy[b])));
+            var accepted = new bool[width];
+            double cumE = 0.0;
+            for (int k = 0; k < width; k++)
+            {
+                int pos = order[k];
+                cumE += entropy[pos];
+                if (cumE - entropy[pos] <= entropyBound) accepted[pos] = true;
+            }
+            return accepted;
+        }
+
+        /// <summary>The adaptive stop: the argmax canvas has held for StabilityThreshold steps AND the mean
+        /// entropy over the request's canvas is below ConfidenceThreshold.</summary>
+        private static bool AdaptiveStop(int[] argmaxCanvas, int[] prevArgmax, ref int held, float entropySum,
+            int width, DiffusionEbParams p)
+        {
             bool same = true;
-            for (int i = 0; i < C; i++) if (prevArgmax[i] != argmaxCanvas[i]) { same = false; break; }
+            for (int i = 0; i < width; i++) if (prevArgmax[i] != argmaxCanvas[i]) { same = false; break; }
             held = same ? held + 1 : 0;
-            bool confident = (entropySum / C) < p.ConfidenceThreshold;
-            Array.Copy(argmaxCanvas, prevArgmax, C);
+            bool confident = (entropySum / width) < p.ConfidenceThreshold;
+            Array.Copy(argmaxCanvas, prevArgmax, width);
             return held >= p.StabilityThreshold && confident;
         }
 
@@ -334,37 +427,25 @@ namespace TensorSharp.Models
         /// kernel). <paramref name="argmaxIn"/>/<paramref name="entropyIn"/>/<paramref name="sampledIn"/> are
         /// the device outputs; <paramref name="renoise"/> the host-drawn fresh tokens for rejected positions.</summary>
         private bool DenoiseStepFromDevice(int[] argmaxIn, float[] entropyIn, int[] sampledIn, int[] renoise,
-            DiffusionEbParams p, int[] currentCanvas, int[] argmaxCanvas, int[] prevArgmax, ref int held, int[] order)
+            DiffusionEbParams p, int[] currentCanvas, int[] argmaxCanvas, int[] prevArgmax, ref int held,
+            int[] order, int width)
         {
             int C = _canvasLength;
-            Array.Copy(argmaxIn, argmaxCanvas, C);   // emitted best-guess = device argmax
+            int W = width;
+            Array.Copy(argmaxIn, argmaxCanvas, W);   // emitted best-guess = device argmax
 
-            // accept lowest-entropy positions within the MI bound (sum of strictly-earlier entropies <= bound)
-            for (int i = 0; i < C; i++) order[i] = i;
-            Array.Sort(order, (a, bb) => entropyIn[a].CompareTo(entropyIn[bb]));
-            var accepted = new bool[C];
-            double cumE = 0.0;
-            for (int kk = 0; kk < C; kk++)
-            {
-                int pos = order[kk];
-                cumE += entropyIn[pos];
-                if (cumE - entropyIn[pos] <= p.EntropyBound) accepted[pos] = true;
-            }
+            var accepted = AcceptLowestEntropy(entropyIn, order, W, p.EntropyBound);
 
             // renoise: accepted -> device multinomial sample, rest -> fresh random; output = argmax canvas
             float entropySum = 0f;
-            for (int pos = 0; pos < C; pos++)
+            for (int pos = 0; pos < W; pos++)
             {
                 currentCanvas[pos] = accepted[pos] ? sampledIn[pos] : renoise[pos];
                 entropySum += entropyIn[pos];
             }
+            for (int pos = W; pos < C; pos++) currentCanvas[pos] = renoise[pos];
 
-            bool same = true;
-            for (int i = 0; i < C; i++) if (prevArgmax[i] != argmaxCanvas[i]) { same = false; break; }
-            held = same ? held + 1 : 0;
-            bool confident = (entropySum / C) < p.ConfidenceThreshold;
-            Array.Copy(argmaxCanvas, prevArgmax, C);
-            return held >= p.StabilityThreshold && confident;
+            return AdaptiveStop(argmaxCanvas, prevArgmax, ref held, entropySum, W, p);
         }
 
         // ===================================================================================
@@ -396,7 +477,21 @@ namespace TensorSharp.Models
             var rng = new DeterministicRng[A];
             var held = new int[A];
             var finished = new bool[A];
+            // finished[] also retires a sequence that has spent its own steps, so convergence - which a
+            // read reports - is tracked apart from it.
+            var converged = new bool[A];
             var prevTempInv = new float[A];
+            // Per-request canvas width and structured-read bookkeeping. A read reports the distribution
+            // itself, which only the full logits carry, so it stays on the host logits path.
+            var width = new int[A];
+            var wantLogprobs = new bool[A];
+            var logprobs = new DiffusionPositionLogprobs[A][];
+            var stepsRun = new int[A];
+            for (int a = 0; a < A; a++)
+            {
+                width[a] = WidthOf(active[a].Params);
+                wantLogprobs[a] = active[a].Params.ReadOnly && active[a].Params.TopLogprobs > 0;
+            }
             int Smax = 1;
 
             // Prompt-KV caching (device-glue backends): prefill each sequence's prefix K/V once, then each
@@ -409,7 +504,7 @@ namespace TensorSharp.Models
             // On-device sampling (CUDA, model fits): per-sequence the lm_head kernel returns argmax/entropy/
             // sampled/top-K directly, so no full [vocab,C] logits cross PCIe. Each sequence keeps its own
             // double-buffered top-K (for self-conditioning), argmax/sampled, mirroring DenoiseBlock.
-            bool useDeviceSample = usePkv && _model.SupportsDeviceSampling;
+            bool useDeviceSample = usePkv && _model.SupportsDeviceSampling && Array.TrueForAll(wantLogprobs, w => !w);
             int K = _model.SelfCondTopK;
             int[][][] dTopTok = useDeviceSample ? new int[A][][] : null;
             float[][][] dTopPrb = useDeviceSample ? new float[A][][] : null;
@@ -439,9 +534,11 @@ namespace TensorSharp.Models
                 rng[a] = new DeterministicRng((ulong)run.Params.Seed);
                 canvas[a] = new int[C];
                 for (int i = 0; i < C; i++) canvas[a][i] = rng[a].NextInt(vocab);
-                argmaxCanvas[a] = new int[C];
-                prevArgmax[a] = new int[C];
-                for (int i = 0; i < C; i++) prevArgmax[a][i] = -1;
+                // A seed canvas describes the answer being read, so it seeds the first block only.
+                if (run.BlockIndex == 0) ApplySeedCanvas(run.Params, canvas[a], width[a]);
+                argmaxCanvas[a] = new int[width[a]];
+                prevArgmax[a] = new int[width[a]];
+                for (int i = 0; i < width[a]; i++) prevArgmax[a][i] = -1;
                 // device sampling carries SC via the top-K buffers, so the 268 MB host logits buffer is unused
                 scBuffer[a] = (_model.SelfConditioningEnabled && !useDeviceSample) ? new float[(long)C * vocab] : null;
                 prevTempInv[a] = 1f;
@@ -506,11 +603,17 @@ namespace TensorSharp.Models
                         int a = live[j];
                         var run = active[a];
                         if (scBuffer[a] != null) Array.Copy(logits[j], scBuffer[a], (long)C * vocab);
+                        int Sa = Math.Max(1, run.Params.MaxDenoisingSteps);
                         bool seqFinished = DenoiseStep(logits[j], subTempInv[j], rng[a], run.Params,
-                            canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u, renoise);
+                            canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u,
+                            renoise, width[a]);
                         prevTempInv[a] = subTempInv[j];
-                        run.EmitPreview(stepIdx, Math.Max(1, run.Params.MaxDenoisingSteps), argmaxCanvas[a]);
-                        if (seqFinished) finished[a] = true;
+                        stepsRun[a]++;
+                        if (wantLogprobs[a] && (seqFinished || stepsRun[a] >= Sa))
+                            logprobs[a] = DiffusionLogprobs.TopKPerPosition(
+                                logits[j], width[a], vocab, run.Params.TopLogprobs);
+                        run.EmitPreview(stepIdx, Sa, argmaxCanvas[a]);
+                        if (seqFinished) { finished[a] = true; converged[a] = true; }
                     }
                 }
                 else
@@ -539,11 +642,12 @@ namespace TensorSharp.Models
                             if (ok)
                             {
                                 bool seqDone = DenoiseStepFromDevice(dArg[a], entropy, dSamp[a], renoise, run.Params,
-                                    canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], order);
+                                    canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], order, width[a]);
                                 dBuf[a] ^= 1;
                                 prevTempInv[a] = tempInv;
+                                stepsRun[a]++;
                                 run.EmitPreview(stepIdx, S, argmaxCanvas[a]);
-                                if (seqDone) finished[a] = true;
+                                if (seqDone) { finished[a] = true; converged[a] = true; }
                                 continue;
                             }
                             useDeviceSample = false;   // kernel rejected: fall back to the host path for the rest
@@ -562,24 +666,45 @@ namespace TensorSharp.Models
                         }
                         if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)C * vocab);
                         bool seqFinished = DenoiseStep(lg, tempInv, rng[a], run.Params,
-                            canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u, renoise);
+                            canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u,
+                            renoise, width[a]);
                         prevTempInv[a] = tempInv;
+                        stepsRun[a]++;
+                        // Only the step that emits is reported, so the top-K sweep runs once per read.
+                        if (wantLogprobs[a] && (seqFinished || stepsRun[a] >= S))
+                            logprobs[a] = DiffusionLogprobs.TopKPerPosition(
+                                lg, width[a], vocab, run.Params.TopLogprobs);
                         run.EmitPreview(stepIdx, S, argmaxCanvas[a]);
-                        if (seqFinished) finished[a] = true;
+                        if (seqFinished) { finished[a] = true; converged[a] = true; }
                     }
+                }
+
+                // A request's step cap is its own: once it has run its steps it leaves the batch, even
+                // though a longer-running sequence keeps the block going. Without this a read capped at
+                // one step would go on denoising to the batch's maximum and emit a canvas it never asked
+                // for - and, past its cap, on a temperature schedule that has run off its end.
+                foreach (int a in live)
+                {
+                    if (stepsRun[a] >= Math.Max(1, active[a].Params.MaxDenoisingSteps)) finished[a] = true;
                 }
 
                 // retire converged sequences from the batch for the remaining steps
                 live.RemoveAll(a => finished[a]);
             }
 
-            // commit each sequence's trimmed block
+            // commit each sequence's block: trimmed for a generation, whole for a read (the canvas IS the
+            // answer there, so an end-of-turn token drawn into a noise slot must not cut it short).
             for (int a = 0; a < A; a++)
             {
-                int cut = TrimCanvas(argmaxCanvas[a], C);
+                int W = width[a];
+                bool readOnly = active[a].Params.ReadOnly;
+                int cut = readOnly ? W : TrimCanvas(argmaxCanvas[a], W);
                 var blockTokens = new List<int>(cut);
                 for (int i = 0; i < cut; i++) blockTokens.Add(argmaxCanvas[a][i]);
-                active[a].CommitBlock(blockTokens, ended: cut < C);
+                if (readOnly)
+                    active[a].SetReadResult(new DiffusionReadResult(
+                        (int[])argmaxCanvas[a].Clone(), logprobs[a], stepsRun[a], converged[a]));
+                active[a].CommitBlock(blockTokens, ended: readOnly || cut < W);
             }
         }
 
@@ -653,6 +778,10 @@ namespace TensorSharp.Models
         public bool Done { get; private set; }
         public CancellationToken Ct { get; }
 
+        /// <summary>The structured read this request produced, set once its read-only block has been
+        /// denoised. Null for an ordinary generation.</summary>
+        public DiffusionReadResult ReadResult { get; private set; }
+
         private readonly Action<DiffusionSeqRun, int, int, int[]> _onPreview;   // (run, step, totalSteps, previewTokens)
 
         public DiffusionSeqRun(int[] promptTokens, DiffusionEbParams p, DiffusionSeqState state,
@@ -680,6 +809,8 @@ namespace TensorSharp.Models
         /// <summary>Commit this block's trimmed tokens. If the block ended (end token / repetition) or this
         /// was the last permitted block, the request is done; otherwise the tokens extend the prefix and the
         /// next block is generated.</summary>
+        internal void SetReadResult(DiffusionReadResult result) => ReadResult = result;
+
         internal void CommitBlock(List<int> blockTokens, bool ended)
         {
             Response.AddRange(blockTokens);

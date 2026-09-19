@@ -225,6 +225,97 @@ built-in skills / code-execution tools are never offered to this family either
 (the protocol entry declares `RendersToolDeclarations = false`), so `--code-exec`
 and skills discovery leave a diffusion request exactly as it was before.
 
+## 6a. Structured reads
+
+A discrete diffusion model denoises a whole canvas per forward pass. Seed the
+canvas with the answer's fixed text, leave only the slots you want read as
+noise, and one denoise step yields a distribution over each of those slots -
+a classifier, not a continuation. TensorSharp exposes that as a **read**.
+
+Three request fields carry it, named after the `extra_args` that vLLM accepts
+for the same model, so a schema layer written against either engine drives the
+other unchanged:
+
+| field | type | meaning |
+|---|---|---|
+| `diffusion_seed_canvas` | `int[]`, exactly the canvas width | replaces the random initial canvas after prefill |
+| `diffusion_canvas_length` | `int` | the leading canvas positions this request owns (default: the served canvas) |
+| `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
+| `diffusion_read_only` | `bool` | emit the argmax canvas at the cap, end the request there, and report temperature-1 logprobs at every position |
+
+A read differs from a generation in three ways:
+
+- **It ends on the canvas it emits.** `MaxBlocks` is pinned to 1, and the
+  canvas is *not* trimmed at an end-of-turn token: the canvas is the answer, so
+  a stray end token drawn into a noise slot must not cut it short.
+- **It reports at temperature 1**, not at the step's place on the denoising
+  schedule. The schedule exists to make sampling converge; tempering the
+  reported numbers would rescale the very probabilities the caller asked for.
+  The argmax is the same either way, so the emitted canvas and the reported
+  distribution always agree on the most likely token.
+- **Its step cap is its own.** A read capped at one step leaves the batch after
+  that step even when a generation alongside it keeps denoising.
+
+Because only the full logits carry a distribution, a read that asks for
+logprobs stays on the host logits path rather than the on-device sampler (whose
+top-K is taken at the step's temperature). That is one readback per step, over
+the handful of steps a read runs. The top-K sweep itself runs once per read,
+on the step that emits.
+
+Note one difference from vLLM: TensorSharp's canvas forward is fixed-width, so
+`diffusion_canvas_length` narrows what the request *owns* rather than what is
+computed. Positions past the width are re-noised every step - they never settle
+and are never emitted - but they cost the same as a full canvas.
+
+### In-process
+
+```csharp
+var options = new DiffusionReadOptions
+{
+    ReadOnly = true,
+    MaxSteps = 1,
+    CanvasWidth = 16,
+    SeedCanvas = seedIds,   // exactly 16 ids
+    TopLogprobs = 20,
+};
+DiffusionReadResult read = await modelService.DiffusionReadAsync(
+    session, history, options, seed: 0, cancellationToken);
+```
+
+`DiffusionReadResult` carries the emitted `Canvas`, one
+`DiffusionPositionLogprobs` per position (token ids and natural log
+probabilities, most likely first), the steps actually run and whether the
+canvas converged rather than hitting its cap. `DiffusionGemmaSampler.Read`
+is the same thing one level down, against raw prompt tokens.
+
+### Over HTTP
+
+`POST /v1/diffusion/read`. Chat completions cannot carry this shape - there is
+no continuation and no finish reason, only per-position logprobs - so it has
+its own route.
+
+```bash
+curl -s localhost:8080/v1/diffusion/read -H 'content-type: application/json' -d '{
+  "messages": [
+    {"role": "system", "content": "{\"questions\": [{\"id\": \"urgent\", \"type\": \"noul\"}]}"},
+    {"role": "user", "content": "Everything is down and we have a demo at noon."}
+  ],
+  "diffusion_seed_canvas_text": "The answer is",
+  "diffusion_max_steps": 1,
+  "top_logprobs": 20,
+  "seed": 0
+}'
+```
+
+The seed canvas goes in as `diffusion_seed_canvas` (token ids) or
+`diffusion_seed_canvas_text` (tokenized server-side, `addSpecial: false`); give
+one, not both. A malformed read is a `400` with an `invalid_request_error`
+before anything reaches the sampler - an id outside the vocabulary is an
+out-of-bounds embedding lookup on the device, and a canvas whose length does not
+match its width would read back different slots than the caller wrote. The
+response is a `diffusion.read` object: the canvas as tokens and decoded text,
+`steps`, `converged`, and a `logprobs` array of `{position, top_logprobs}`.
+
 ## 7. Test coverage
 
 [`DiffusionGemmaTests`](../../InferenceWeb.Tests/DiffusionGemmaTests.cs) is
@@ -236,11 +327,21 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
 - Regression guards for repeated-token output and device-memory retention.
 - Batched decode equivalence and two-request generation through the scheduler
   style used by the server.
+- Structured reads: the emitted canvas and its per-position distribution, the
+  read's equivalence between the single-request and batched paths, and the
+  per-request step cap in a batch with a longer generation.
+
+[`DiffusionStructuredReadTests`](../../InferenceWeb.Tests/DiffusionStructuredReadTests.cs)
+needs no checkpoint and runs in ordinary CI: what a read is allowed to ask for
+(and the refusals), what it does to the sampler parameters, and the temperature-1
+top-K itself.
 
 ## 8. Remaining work
 
 - Add dedicated API examples once Ollama/OpenAI adapters grow a diffusion-aware
   compatibility surface.
+- Let `diffusion_canvas_length` narrow the canvas forward itself, not only what
+  the request owns, so a short read stops paying for the served canvas.
 - Promote true batched canvas decode only if it wins on target GPUs; today the
   fused single-canvas path can be faster when one canvas already saturates the
   GPU.

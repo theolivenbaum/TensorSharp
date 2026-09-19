@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -691,6 +691,152 @@ public class DiffusionGemmaTests
         _output.WriteLine($"[diffusion-gemma][batched] pkv={model.SupportsPromptKvCache} " +
             $"solo={solo.Count} tokens, batched={run.Response.Count} tokens");
         Assert.Equal(solo, run.Response);
+    }
+
+    // ---- Structured reads --------------------------------------------------
+    //
+    // A read seeds the canvas with the answer's fixed text, leaves the slots it wants read as noise and
+    // denoises for a bounded number of steps; what it wants back is the distribution over each slot, not
+    // a continuation. These pin the shape of that contract against a real model - the numbers themselves
+    // belong to the checkpoint, so what is asserted is what a caller can rely on regardless of it.
+
+    /// <summary>Seed the first <paramref name="width"/> canvas positions with a short answer template,
+    /// with the last position left as an out-of-template token to stand for the slot being read.</summary>
+    private int[] SeedTemplate(DiffusionGemmaModel model, int width)
+    {
+        var ids = model.Tokenizer.Encode("The answer is", addSpecial: false);
+        var seed = new int[width];
+        for (int i = 0; i < width; i++) seed[i] = ids[i % ids.Count];
+        return seed;
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_EmitsTheWholeSeededCanvas_WithATemperatureOneDistributionPerSlot()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        int width = Math.Min(8, model.CanvasLength);
+        var prompt = RenderPrompt(model, "Is the sky blue? Answer yes or no.");
+        var options = new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 1,
+            CanvasWidth = width,
+            SeedCanvas = SeedTemplate(model, width),
+            TopLogprobs = 8,
+        };
+        options.Validate(model.CanvasLength, model.VocabSize);
+
+        var p = FixedStepParams(48);
+        options.ApplyTo(p, model.CanvasLength);
+        Assert.Equal(1, p.MaxDenoisingSteps);   // the read's cap wins over the sampler default
+
+        var result = new DiffusionGemmaSampler(model).Read(prompt, p);
+
+        // One canvas is the whole output: emitted at the cap, untrimmed, exactly as wide as asked for.
+        Assert.Equal(width, result.Canvas.Length);
+        Assert.Equal(1, result.StepsRun);
+        Assert.False(result.Converged);
+        Assert.Equal(width, result.Logprobs.Count);
+
+        for (int pos = 0; pos < width; pos++)
+        {
+            var lp = result.Logprobs[pos];
+            Assert.Equal(8, lp.TokenIds.Length);
+            // The emitted canvas is the argmax canvas, so the distribution has to lead with it.
+            Assert.Equal(result.Canvas[pos], lp.TokenIds[0]);
+            double mass = 0;
+            for (int i = 0; i < lp.Logprobs.Length; i++)
+            {
+                Assert.True(lp.Logprobs[i] <= 0f, $"logprob {lp.Logprobs[i]} at slot {pos} is not a logprob");
+                if (i > 0) Assert.True(lp.Logprobs[i] <= lp.Logprobs[i - 1], "top-k is not ranked");
+                mass += Math.Exp(lp.Logprobs[i]);
+            }
+            Assert.True(mass <= 1.0 + 1e-3, $"top-8 mass {mass:F4} at slot {pos} exceeds 1");
+        }
+        _output.WriteLine($"[diffusion-gemma][read] canvas: {model.Tokenizer.Decode(new List<int>(result.Canvas))}");
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_ThroughTheBatchedScheduler_MatchesTheSingleRequestPath()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        int width = Math.Min(8, model.CanvasLength);
+        var prompt = RenderPrompt(model, "Is the sky blue? Answer yes or no.");
+        var p = FixedStepParams(2);
+        new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 2,
+            CanvasWidth = width,
+            SeedCanvas = SeedTemplate(model, width),
+            TopLogprobs = 4,
+        }.ApplyTo(p, model.CanvasLength);
+
+        var solo = new DiffusionGemmaSampler(model).Read(prompt, p);
+
+        var run = new DiffusionSeqRun(prompt, p, model.CreateSeqState(), CancellationToken.None, null);
+        try
+        {
+            new DiffusionGemmaSampler(model).RunBlockBatched(new List<DiffusionSeqRun> { run });
+        }
+        finally
+        {
+            model.DisposeSeqState(run.State);
+        }
+
+        Assert.True(run.Done);                       // a read never asks for a second block
+        Assert.NotNull(run.ReadResult);
+        Assert.Equal(solo.Canvas, run.ReadResult.Canvas);
+        Assert.Equal(solo.StepsRun, run.ReadResult.StepsRun);
+        Assert.Equal(width, run.Response.Count);     // untrimmed: the canvas IS the answer
+        for (int pos = 0; pos < width; pos++)
+            Assert.Equal(solo.Logprobs[pos].TokenIds, run.ReadResult.Logprobs[pos].TokenIds);
+    }
+
+    // A read capped at one step used to keep denoising to the LONGEST request in the batch, emitting a
+    // canvas it never asked for (and, past its cap, on a temperature schedule run off its end). The cap
+    // is per request, so the read has to leave the batch while the generation carries on.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_LeavesTheBatchAtItsOwnStepCap()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+        if (!model.SupportsPromptKvCache)
+        {
+            _output.WriteLine("[diffusion-gemma][read] CPU backend; skipping mixed-batch test");
+            return;
+        }
+
+        int width = Math.Min(8, model.CanvasLength);
+        var readParams = FixedStepParams(48);
+        new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 1,
+            CanvasWidth = width,
+            SeedCanvas = SeedTemplate(model, width),
+        }.ApplyTo(readParams, model.CanvasLength);
+
+        var read = new DiffusionSeqRun(RenderPrompt(model, "Is the sky blue? Answer yes or no."),
+            readParams, model.CreateSeqState(), CancellationToken.None, null);
+        var generation = new DiffusionSeqRun(RenderPrompt(model, "What is the capital of France?"),
+            FixedStepParams(4), model.CreateSeqState(), CancellationToken.None, null);
+        try
+        {
+            new DiffusionGemmaSampler(model).RunBlockBatched(new List<DiffusionSeqRun> { read, generation });
+        }
+        finally
+        {
+            model.DisposeSeqState(read.State);
+            model.DisposeSeqState(generation.State);
+        }
+
+        Assert.Equal(1, read.ReadResult.StepsRun);
+        Assert.True(generation.Response.Count > 0, "the longer request was cut short with the read");
     }
 
     /// <summary>Drive two prompts through the batched sampler to completion (block-synchronous, as the
