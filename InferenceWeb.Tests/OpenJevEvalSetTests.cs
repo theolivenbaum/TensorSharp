@@ -155,8 +155,7 @@ public class OpenJevEvalSetTests
     {
         string dir = System.Environment.GetEnvironmentVariable(EnvModelDir)!;
         string path = TestGates.FindGguf(dir, GgufPattern)!;
-        using var model = (DiffusionGemmaModel)ModelBase.Create(
-            path, OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu);
+        using var model = (DiffusionGemmaModel)ModelBase.Create(path, TestGates.PreferredTestBackend);
 
         var set = Load();
         var benchmark = new StructuredBenchmark(

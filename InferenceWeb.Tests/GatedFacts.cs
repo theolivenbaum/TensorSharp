@@ -108,6 +108,32 @@ namespace InferenceWeb.Tests
         /// directory must hold a matching GGUF (see <see cref="FindGguf"/>).
         /// </summary>
         /// <summary>
+        /// The backend a model-gated test should load on: <c>TS_TEST_BACKEND</c> when set, else the GPU
+        /// path on macOS and CPU elsewhere. One place, so every such test honours the same variable -
+        /// a documented knob that only some tests read is worse than none.
+        /// </summary>
+        public static BackendType PreferredTestBackend
+        {
+            get
+            {
+                string requested = Environment.GetEnvironmentVariable("TS_TEST_BACKEND");
+                BackendType fallback = OperatingSystem.IsMacOS()
+                    ? BackendType.GgmlMetal : BackendType.GgmlCpu;
+                if (string.IsNullOrWhiteSpace(requested)) return fallback;
+                return requested.ToLowerInvariant() switch
+                {
+                    "cpu" => BackendType.Cpu,
+                    "cuda" => BackendType.Cuda,
+                    "ggmlcpu" or "ggml_cpu" => BackendType.GgmlCpu,
+                    "ggmlcuda" or "ggml_cuda" => BackendType.GgmlCuda,
+                    "ggmlmetal" or "ggml_metal" => BackendType.GgmlMetal,
+                    "mlx" => BackendType.Mlx,
+                    _ => fallback,
+                };
+            }
+        }
+
+        /// <summary>
         /// Skip reason for a test that replays a third-party evaluation set. The data carries its own
         /// rights and is not vendored here, so the test points at a checkout named by an environment
         /// variable and skips visibly when there is not one.

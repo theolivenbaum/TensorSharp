@@ -413,6 +413,86 @@ real, and a scripted reader stands in for the denoise, so the canvas, the
 constrained readout, the canvas packing and the benchmark harness are exercised
 on their own terms.
 
+## 7a. Running the tests locally
+
+Most of this area's tests need no checkpoint and run in a normal `dotnet test`.
+The ones that do are gated on environment variables and **skip visibly** when
+they are unset, so a plain run is green without silently proving nothing.
+
+### Without a checkpoint
+
+```bash
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+    --filter "FullyQualifiedName~DiffusionStructuredReadTests|FullyQualifiedName~StructuredDecisionTests"
+```
+
+Covers what a read may ask for and the refusals, the temperature-1 top-K, the
+JSON canvas and its constrained readout, canvas packing and splitting, the tight
+canvas fit, and the benchmark harness including its OOM sweep and scoring.
+
+### With the checkpoint
+
+```bash
+hf download unsloth/diffusiongemma-26B-A4B-it-GGUF \
+    diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir models
+
+TS_TEST_MODEL_DIR=$PWD/models \
+TS_TEST_BACKEND=ggmlcuda \
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+    --filter "FullyQualifiedName~DiffusionGemmaTests"
+```
+
+`TS_TEST_MODEL_DIR` takes the directory (any GGUF whose name contains
+`diffusiongemma`, `diffusion-gemma`, `gemma-diffusion` or `gemmadiffusion`) or
+the file itself. `TS_TEST_BACKEND` is one of `ggmlcuda`, `ggmlmetal`, `ggmlcpu`,
+`cuda`, `cpu`, `mlx`; it defaults to `ggmlmetal` on macOS and `ggmlcpu`
+elsewhere. The CPU backend works and is slow — it runs the unified
+`[prompt|canvas]` forward rather than prefill + canvas decode.
+
+Two of these are timing comparisons (prompt-KV against the unified forward, a
+narrow canvas against the served one). Run them on an otherwise idle machine:
+under load they compare contended numbers and can fail on a build that is fine.
+
+### Replaying open-jev's evaluation set
+
+The data is third-party and is not vendored here, so point the tests at a
+checkout:
+
+```bash
+git clone https://github.com/theolivenbaum/open-jev /tmp/open-jev
+
+TS_OPEN_JEV_DIR=/tmp/open-jev \
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+    --filter "FullyQualifiedName~OpenJevEvalSetTests"
+```
+
+Three of those four cases need no checkpoint: they pin the importer against
+open-jev's published question counts and baseline accuracy, which is what makes
+a receipt produced here comparable to one produced there. Add
+`TS_TEST_MODEL_DIR` and the fourth replays all 408 questions through the model
+and prints a receipt.
+
+### Trying the HTTP surface
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cuda
+
+curl -s localhost:5000/v1/diffusion/read -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Is the sky blue? Answer yes or no."}],
+  "diffusion_seed_canvas_text": "The answer is",
+  "diffusion_max_steps": 1,
+  "top_logprobs": 10,
+  "seed": 0
+}'
+```
+
+The canvas width comes from the checkpoint (`diffusion.canvas_length`, 256 for
+this one); there is no flag for it. A request narrows its own canvas with
+`diffusion_canvas_length`, which is what
+[`TensorSharp.Structured`](../../TensorSharp.Structured/README.md)'s tight
+canvas fit does.
+
 ## 8. Remaining work
 
 - Add dedicated API examples once Ollama/OpenAI adapters grow a diffusion-aware
