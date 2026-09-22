@@ -95,25 +95,51 @@ The constants djev hard-codes hold for this vocabulary: 106 is `<turn|>`, 0 is `
   prompt; answers are unaffected, latency is.
 - **Images**, as above.
 
-## First run on a real checkpoint (CPU, Q2_K)
+## First runs on a real checkpoint (CPU)
 
-The only DiffusionGemma GGUF that fits a 15 GB, 4-core, GPU-less VM is DevQuasar's Q2_K (10.6 GB; the
-smallest official quant, Q4_K_M, is 16.8 GB). On it, with ggml_cpu and AVX-512:
+On a 4-core Xeon VM with 15 GB of RAM and no GPU (ggml_cpu, AVX-512), unsloth's Q4_K_M (16.8 GB) runs from
+its memory map although it is larger than RAM; resident memory settles around 12.4 GB, and short prompts
+do not visibly thrash.
 
-| request | prompt tokens | canvas | warm time |
-|---|---:|---:|---:|
-| one Noul question | 125 | 16 | 6.2 s |
-| Laya's triage preset, 5 questions, one joint read | 329 | 32 | 15.6-16.0 s |
-| a JevBench hard-tier policy (one Choice) | 3 963 | 16 | 240 s |
+**Parity on the real tokenizer.** With the GGUF loaded, `DjevGemmaParityTests` finds all 231 public
+JevBench answer templates, slot label ids, seed canvases and prompt token ids identical to djev's.
 
-Model load is under a second (quantized weights are mmap views); the first read pays for paging them in.
-Time is dominated by the prompt forward and grows roughly linearly with prompt length (~50-60 ms per
-token here); ggml_cpu has no prompt-KV cache, so nothing is reused across requests.
+**Answers.** Public JevBench decisions, sent as jevbench's djev adapter sends them with djev's default
+options, compared per task with djev's own published run (`results/v1.2/additions/djev-per-task.json`,
+BF16 on vLLM):
 
-Q2_K is not usable for answers: `DiffusionDecisionBench probe` shows the answer slots put almost no
-probability on any allowed label (label mass < 1 %), even the fixed template positions are not
-reproduced, and plain generation of "What is the capital of France?" gives "Theing of France is to".
-Accuracy needs Q4_K_M or better (and a GPU for useful latency).
+| tier | decisions | TensorSharp Q4_K_M | djev (published) | same outcome |
+|---|---:|---:|---:|---:|
+| easy | 48 | 48 (100 %) | 48 | 48 |
+| standard (`original.jsonl`) | 72 | 70 (97.2 %) | 71 | 71 |
+| hard, first 25 (long-policy, multi-hop) | 25 | 11 (44 %) | 13 | 19 |
+
+The two runs reach the same outcome on 138 of 145 decisions; the rest go both ways (djev alone right on
+five, TensorSharp alone on two), which is what a 4-bit quant against BF16 looks like rather than a
+systematic error. Label mass at the answer slots is 0.88-0.98 on short prompts: the model puts nearly all
+its probability on the allowed labels. Hard-tier calibration over those 25 is ECE 0.39, TVD 0.51 to the
+gold distributions.
+
+**Latency** (warm, one request at a time, in-process):
+
+| request | prompt tokens | canvas | Q4_K_M | Q2_K |
+|---|---:|---:|---:|---:|
+| one Noul question | 121 | 16 | 6.8 s | 6.2 s |
+| Laya's triage preset, 5 questions, one joint read | 321-329 | 32 | 18.5-19.4 s | 15.6-16.0 s |
+| JevBench easy + standard, per decision | 168 mean | 16 | p50 14.7 s, p95 19.8 s | - |
+| JevBench hard, first 25, per decision | 1 415 mean | 16 | p50 40.2 s, p95 195 s | - |
+| a JevBench hard-tier policy (one Choice) | 3 963 | 16 | 277 s | 240 s |
+
+Model load is under a second (the weights are mmap views); the first read pays for paging them in. Time is
+the prompt forward, roughly linear in prompt length at ~55-70 ms per token here; ggml_cpu has no prompt-KV
+cache, so nothing is reused across requests. This is a CPU measurement of a model meant for a GPU - djev's
+reference numbers are tens of milliseconds on a B200.
+
+**Q2_K is not usable** (DevQuasar's 10.6 GB community quant, the only one that fits in RAM outright):
+`DiffusionDecisionBench probe` shows its answer slots carry under 1 % label mass, it does not reproduce
+even the fixed template tokens, and plain generation of "What is the capital of France?" gives
+"Theing of France is to". Q4_K_M on the same code reads correctly, so the quantization, not the
+implementation, was at fault.
 
 ## Using it
 

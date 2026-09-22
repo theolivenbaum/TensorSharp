@@ -315,6 +315,8 @@ namespace TensorSharp.Structured.Evals
                       "not comparable to jevbench's serial measurements.",
                 "Cost prices input tokens as counted by this engine's tokenizer and chat template; it is a tariff estimate, not an invoice.",
             };
+            if (calibration is null)
+                caveats.Add("No hard-tier decisions were scored, so Calibration and public_subset_score are not reported.");
             if (set.Sources.Any(s => s.MatchesManifest == false))
                 caveats.Add("At least one split file does not match jevbench's manifest hash; see sources.");
 
@@ -350,7 +352,9 @@ namespace TensorSharp.Structured.Evals
                 PricingSource = options.PricingSource,
                 DeviceUsdPer1000Decisions = deviceUsd,
                 Cost = cost,
-                PublicSubsetScore = intelligence is null ? null
+                // Every axis has to have been measured: a hard tier that did not run leaves Calibration
+                // unknown, and scoring it as 0 (jevbench's rule for label-only systems) would misstate the run.
+                PublicSubsetScore = intelligence is null || calibration is null || speed is null || cost is null ? null
                     : JevBenchScoring.Composite(intelligence, calibration, speed, cost),
                 CanvasWidths = outcomes.Where(o => o.CanvasTokens is not null).Select(o => o.CanvasTokens!.Value)
                     .Distinct().OrderDescending().ToList(),

@@ -339,16 +339,15 @@ static async Task<int> JevBench(CommandLine options)
     foreach ((string tier, JevBenchTierSummary summary) in report.Tiers)
         Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "  {0,-9} {1,4}/{2,-4} {3,7:P1}  chance {4:P1}  above chance {5,5:F1}",
             tier, summary.Correct, summary.Scorable, summary.Accuracy ?? 0, summary.Chance, summary.ChanceCorrected ?? 0));
-    Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
-        "  accuracy {0:P1}, intelligence {1:F1} (published chance {2:F1}), calibration {3:F1} (ECE {4:F3}, TVD {5:F3})",
-        report.Accuracy ?? 0, report.Intelligence ?? 0, report.IntelligencePublishedChance ?? 0,
-        report.Calibration ?? 0, report.EceHard ?? 0, report.MeanTvdHard ?? 0));
-    Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
-        "  p50 {0:F3} s, p95 {1:F3} s, speed {2:F1} ({3}), {4:F1} decisions/s",
-        report.P50S ?? 0, report.P95S ?? 0, report.Speed ?? 0, report.EndpointKind, report.DecisionsPerSecond));
-    Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
-        "  {0:F0} input tokens/decision, ${1:F4} per 1,000 decisions, cost {2:F1}; public-subset score {3:F1}",
-        report.MeanInputTokens, report.UsdPer1000Decisions ?? 0, report.Cost ?? 0, report.PublicSubsetScore ?? 0));
+    static string N(double? value, string format) => value is { } v ? v.ToString(format, CultureInfo.InvariantCulture) : "n/a";
+    Console.WriteLine($"  accuracy {N(report.Accuracy, "P1")}, intelligence {N(report.Intelligence, "F1")} " +
+        $"(published chance {N(report.IntelligencePublishedChance, "F1")}), calibration {N(report.Calibration, "F1")} " +
+        $"(ECE {N(report.EceHard, "F3")}, TVD {N(report.MeanTvdHard, "F3")})");
+    Console.WriteLine($"  p50 {N(report.P50S, "F3")} s, p95 {N(report.P95S, "F3")} s, speed {N(report.Speed, "F1")} " +
+        $"({report.EndpointKind}), {report.DecisionsPerSecond.ToString("F2", CultureInfo.InvariantCulture)} decisions/s");
+    Console.WriteLine($"  {report.MeanInputTokens.ToString("F0", CultureInfo.InvariantCulture)} input tokens/decision, " +
+        $"${N(report.UsdPer1000Decisions, "F4")} per 1,000 decisions, cost {N(report.Cost, "F1")}; " +
+        $"public-subset score {N(report.PublicSubsetScore, "F1")}");
     Console.WriteLine($"  {report.Failed} failed, {report.Valid} valid distributions; receipt: {output}");
     return 0;
 }
