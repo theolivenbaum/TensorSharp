@@ -28,6 +28,9 @@
     <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />
     <EmbeddedResource Include="Fixtures/Qwen35MRope/reference_positions.json" />
     <EmbeddedResource Include="Fixtures/Glm4Tokenizer/reference.json" />
+    <EmbeddedResource Include="Fixtures/Djev/djev_fixtures.json" />
+    <EmbeddedResource Include="Fixtures/Djev/gemma_fixtures.json" />
+    <EmbeddedResource Include="Fixtures/Djev/gemma_chat_template.jinja" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" />

@@ -1045,6 +1045,45 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
+        /// A structured read over prompt tokens the caller already rendered and tokenized - the
+        /// <c>token_ids</c> transport djev uses against vLLM. Nothing is truncated: a prompt that does not
+        /// fit is the caller's to refuse, because a silently shortened prompt answers a different question.
+        /// The read joins the diffusion scheduler like any other request, so concurrent reads share blocks.
+        /// </summary>
+        public async Task<DiffusionReadResult> DiffusionReadTokensAsync(
+            int[] promptTokens,
+            DiffusionReadOptions options,
+            int seed = 0,
+            CancellationToken cancellationToken = default)
+        {
+            if (promptTokens == null || promptTokens.Length == 0)
+                throw new ArgumentException("A read needs prompt tokens.", nameof(promptTokens));
+            if (options == null) throw new ArgumentNullException(nameof(options));
+            var model = (DiffusionGemmaModel)(_lifecycle.Model
+                ?? throw new InvalidOperationException("No model is loaded."));
+
+            options.ReadOnly = true;
+            options.Validate(model.CanvasLength, model.VocabSize);
+            foreach (int t in promptTokens)
+            {
+                if (t < 0 || t >= model.VocabSize)
+                    throw new ArgumentException($"prompt token ids must be in [0, {model.VocabSize}).", nameof(promptTokens));
+            }
+
+            var ebParams = new DiffusionEbParams
+            {
+                MaxDenoisingSteps = DiffusionMaxSteps,
+                Seed = seed,
+                MaxBlocks = 1,
+            };
+            options.ApplyTo(ebParams, model.CanvasLength);
+
+            var handle = GetDiffusionScheduler(model).Submit(promptTokens, ebParams, cancellationToken);
+            await handle.Completion.ConfigureAwait(false);
+            return await handle.Read.ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// Run the family's output parser over one whole denoised canvas. A diffusion
         /// canvas is re-decoded from scratch at every step rather than appended to, so
         /// each call gets a fresh parser primed with the prompt's open channel, if any.

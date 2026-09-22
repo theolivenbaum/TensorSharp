@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Structured.Decisions;
 
 namespace TensorSharp.Structured
 {
@@ -57,7 +58,7 @@ namespace TensorSharp.Structured
     /// Each read holds the model's compute lock for its block, so concurrent calls serialize; hand this
     /// the whole batch rather than calling it once per request.
     /// </summary>
-    public sealed class DiffusionGemmaReader : IStructuredReader
+    public sealed class DiffusionGemmaReader : IStructuredReader, IDecisionReader
     {
         private static readonly IPromptRenderer Renderer = new GgufPromptRenderer();
 
@@ -80,6 +81,29 @@ namespace TensorSharp.Structured
         public int VocabSize => _model.VocabSize;
         public int EosTokenId => _model.Tokenizer.EosTokenIds is { Length: > 0 } eos ? eos[0] : 0;
 
+        /// <summary>The checkpoint's declared context, else djev's default of 32768.</summary>
+        public int MaxContextLength => _model.Config.DeclaredContextLength > 0 ? _model.Config.DeclaredContextLength : 32768;
+
+        public string ModelName => "diffusiongemma";
+
+        /// <inheritdoc/>
+        public int[] EncodeChat(string system, string user) =>
+            _model.Tokenizer.Encode(
+                DecisionPrompt.Render(_model.Config.ChatTemplate, _model.Config.Architecture, system, user),
+                addSpecial: true).ToArray();
+
+        /// <inheritdoc/>
+        public Task<IReadOnlyList<DiffusionReadResult>> ReadAsync(
+            IReadOnlyList<DecisionRead> reads, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(reads);
+            if (reads.Count == 0)
+                return Task.FromResult<IReadOnlyList<DiffusionReadResult>>(Array.Empty<DiffusionReadResult>());
+            var batch = new List<(int[] Prompt, DiffusionReadOptions Options, int Seed)>(reads.Count);
+            foreach (DecisionRead read in reads) batch.Add((read.PromptTokens, read.Options, read.SamplerSeed));
+            return Task.Run<IReadOnlyList<DiffusionReadResult>>(() => Read(batch, cancellationToken), cancellationToken);
+        }
+
         public Task<IReadOnlyList<DiffusionReadResult>> ReadAsync(
             IReadOnlyList<StructuredRead> reads, CancellationToken cancellationToken = default)
         {
@@ -89,12 +113,17 @@ namespace TensorSharp.Structured
 
             // The sampler is synchronous and owns the GPU for the block; run it off the caller's thread so
             // an async pipeline is not blocked by it.
-            return Task.Run<IReadOnlyList<DiffusionReadResult>>(() => Read(reads, cancellationToken),
-                cancellationToken);
+            return Task.Run<IReadOnlyList<DiffusionReadResult>>(() =>
+            {
+                var batch = new List<(int[] Prompt, DiffusionReadOptions Options, int Seed)>(reads.Count);
+                foreach (StructuredRead read in reads) batch.Add((Tokenize(read.Prompt), read.Options, read.Seed));
+                return Read(batch, cancellationToken);
+            }, cancellationToken);
         }
 
         private IReadOnlyList<DiffusionReadResult> Read(
-            IReadOnlyList<StructuredRead> reads, CancellationToken cancellationToken)
+            IReadOnlyList<(int[] Prompt, DiffusionReadOptions Options, int Seed)> reads,
+            CancellationToken cancellationToken)
         {
             var runs = new List<DiffusionSeqRun>(reads.Count);
             var states = new List<DiffusionSeqState>(reads.Count);
@@ -102,17 +131,17 @@ namespace TensorSharp.Structured
             {
                 lock (_model.GpuComputeLock)
                 {
-                    foreach (StructuredRead read in reads)
+                    foreach ((int[] prompt, DiffusionReadOptions options, int seed) in reads)
                     {
-                        read.Options.Validate(CanvasLength, VocabSize);
+                        options.Validate(CanvasLength, VocabSize);
                         var parameters = Clone(_defaults);
-                        parameters.Seed = read.Seed;
-                        read.Options.ApplyTo(parameters, CanvasLength);
+                        parameters.Seed = seed;
+                        options.ApplyTo(parameters, CanvasLength);
 
                         DiffusionSeqState state = _model.CreateSeqState();
                         states.Add(state);
                         runs.Add(new DiffusionSeqRun(
-                            Tokenize(read.Prompt), parameters, state, cancellationToken, onPreview: null!));
+                            prompt, parameters, state, cancellationToken, onPreview: null!));
                     }
 
                     // A read ends on the canvas it emits, so one block answers the whole batch.

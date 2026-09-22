@@ -376,6 +376,30 @@ Questions on one canvas share attention, and a question set too large for one
 canvas is split and merged - so this does not isolate questions from one
 another.
 
+## 6c. Typed decisions the djev way
+
+[djev](https://github.com/Davipar/djev-dev) is the reference implementation of typed decisions on this
+model, and `TensorSharp.Structured.Decisions` follows it prompt for prompt and canvas for canvas: Noul /
+Choice / Score questions become a system prompt and a one-token-per-question answer template
+(`<|channel>thought\n<channel|>0:A\n1:no…`), the canvas is the template plus `<turn|>` rounded up to 16
+tokens with seeded noise at the answer slots, and one denoising step later each slot's distribution over
+its exact label ids is the answer.
+
+```csharp
+using var agent = DiffusionAgent.Load("models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf", BackendType.GgmlCuda);
+DecisionResult result = agent.SystemOne("I was charged twice", Presets.Triage());
+```
+
+The server answers djev's `POST /v1/request` with djev's request and response bodies. The reads go
+through the diffusion scheduler with the prompt tokenized once and never truncated
+(`ModelService.DiffusionReadTokensAsync`): a request whose prompt and canvas exceed the context is a 422,
+not a shorter question.
+
+What differs from the JSON canvas above, what was found in the review (among it, that the chat template's
+`<|turn>model\n` boundary used to be trimmed for this architecture), and how parity with djev's own
+engine is tested: [diffusiongemma-djev.md](diffusiongemma-djev.md). The JevBench harness:
+[`benchmarks/DiffusionDecisionBench`](../../benchmarks/DiffusionDecisionBench/README.md).
+
 ## 7. Test coverage
 
 [`DiffusionGemmaTests`](../../InferenceWeb.Tests/DiffusionGemmaTests.cs) is
@@ -407,6 +431,12 @@ needs no checkpoint and runs in ordinary CI: what a read is allowed to ask for
 (and the refusals), what it does to the sampler parameters, and the temperature-1
 top-K itself.
 
+[`DjevDecisionTests`](../../InferenceWeb.Tests/DjevDecisionTests.cs) replays cases recorded from djev's own
+engine and must reproduce its prompts, canvases and answers; [`DjevGemmaParityTests`](../../InferenceWeb.Tests/DjevGemmaParityTests.cs)
+checks the rendered prompt text against the pinned Gemma template without a checkpoint and the token ids
+with one; [`DjevJevBenchTests`](../../InferenceWeb.Tests/DjevJevBenchTests.cs) covers jevbench's scoring
+rules, the loader (`TS_JEVBENCH_DIR`) and a model replay.
+
 [`StructuredDecisionTests`](../../InferenceWeb.Tests/StructuredDecisionTests.cs)
 also runs without a checkpoint: a character tokenizer compiles the canvases for
 real, and a scripted reader stands in for the denoise, so the canvas, the
@@ -423,8 +453,10 @@ they are unset, so a plain run is green without silently proving nothing.
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
-    --filter "FullyQualifiedName~DiffusionStructuredReadTests|FullyQualifiedName~StructuredDecisionTests"
+    --filter "FullyQualifiedName~DiffusionStructuredReadTests|FullyQualifiedName~StructuredDecisionTests|FullyQualifiedName~Djev"
 ```
+
+`TS_JEVBENCH_DIR=/path/to/jevbench` adds the JevBench loader and receipt tests.
 
 Covers what a read may ask for and the refusals, the temperature-1 top-K, the
 JSON canvas and its constrained readout, canvas packing and splitting, the tight

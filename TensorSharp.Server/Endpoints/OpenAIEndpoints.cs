@@ -41,6 +41,13 @@ public static class OpenAIEndpoints
         endpoints.MapPost("/v1/diffusion/read",
             (HttpContext ctx, DiffusionReadAdapter adapter) => adapter.ReadAsync(ctx))
             .DisableRequestTimeout();
+        // djev's typed-decision API on the same model: Noul / Choice / Score questions in, calibrated-to-the-
+        // allowed-labels distributions out, from one-step reads of exact label probabilities.
+        endpoints.MapPost("/v1/request",
+            (HttpContext ctx, DecisionRequestAdapter adapter) => adapter.RequestAsync(ctx))
+            .DisableRequestTimeout();
+        endpoints.MapGet("/v1/request/config",
+            (HttpContext ctx) => ctx.RequestServices.GetRequiredService<DecisionRequestAdapter>().Config());
         // Text-to-video generation (Wan models). OpenAI has no stable public video
         // API yet; this follows the images/generations envelope: prompt in, a data
         // array with url and (optionally) b64_json out.

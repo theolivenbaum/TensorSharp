@@ -1,5 +1,103 @@
 # TensorSharp.Structured
 
+Typed decisions on DiffusionGemma, two ways:
+
+- **`TensorSharp.Structured.Decisions` - djev's structured read.** Noul / Choice / Score questions compiled
+  into a one-token-per-question answer template, one denoising step, and the exact probabilities of each
+  question's allowed label tokens. This follows [djev](https://github.com/Davipar/djev-dev), the reference
+  implementation, prompt for prompt and canvas for canvas, and is the recommended path. It answers with
+  djev's response shape, and `TensorSharp.Server` serves djev's `POST /v1/request`.
+- **`StructuredPredictor` - the JSON canvas.** open-jev's construction: every allowed answer tokenized as a
+  JSON document, the scaffolding pinned, a greedy readout over the free positions. Kept as it was; see
+  [below](#the-json-canvas-open-jev).
+
+How the two differ, and how the djev path is checked against djev's own engine, is in
+[docs/models/diffusiongemma-djev.md](../docs/models/diffusiongemma-djev.md).
+
+## Decisions (djev)
+
+The API mirrors [Laya](https://github.com/theolivenbaum/laya)'s: a `QuestionSet`, one call, typed answers.
+
+```csharp
+using TensorSharp.Structured.Decisions;
+
+using var agent = DiffusionAgent.Load("models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf", BackendType.GgmlCuda);
+
+var result = agent.SystemOne("I was charged twice and nobody answers", Presets.Triage());
+
+// (the values below are illustrative, not a measured output)
+result["intent"].Choice;            // "refund"   - the most probable option
+result["intent"].Probabilities;     // every option, in option order
+result["frustration"].Score;        // 2.1        - the expected level on the 0..3 rubric
+result["refund_requested"].Noul;    // 0.93       - P(yes), relative to no/yes
+result["intent"].Confidence;        // 0.61       - entropy concentration, not calibration
+result.Usage;                       // input tokens read, output tokens (the canvas template)
+```
+
+Questions are built the same way as in Laya:
+
+```csharp
+var questions = new QuestionSet()
+    .Add("intent", Question.Choice("What does the customer want?",
+        ("refund", "money returned or a duplicate charge reversed"),
+        ("technical_help", "a bug, outage or integration problem"),
+        ("other", null)))
+    .Add("urgency", Question.Score("How urgent is this?",
+        "no time pressure", "needs attention soon", "blocking issue or hard deadline"))
+    .Add("permitted", Question.Noul("Is the refund permitted under the policy?",
+        trueCriterion: "every condition holds", falseCriterion: "a condition is missing"));
+
+// State is a string, or anything that serializes to a JSON object or array.
+var answer = agent.SystemOne(new { subject = "Invoice #4411", body = "Billed twice." }, questions,
+    new DecisionOptions { Samples = 2, Isolation = DecisionIsolation.Independent, Diagnostics = true });
+```
+
+`Presets` carries Laya's five sets (`Triage`, `Email`, `Guard`, `Moderation`, `ModelRouter`), so the same
+workflow can be asked of both engines and compared.
+
+| option | djev field | meaning |
+|---|---|---|
+| `Samples` | `samples` | 1-4 one-step reads, averaged |
+| `Seed` | `seed` | the canvas seed (any integer; `null` draws one) |
+| `Isolation` | `isolation` | `Joint`: one canvas; `Independent`: one read per distinct question |
+| `ScoreMode` | `score_mode` | `IndependentLevels`: each level its own yes/no read, combined by odds (needs `Independent`) |
+| `Diagnostics` | `diagnostics` | label mass, entropy, read counts, canvas width |
+
+A djev request body works as is - `DecisionRequest.FromJson(body)` - and `result.ToJsonString()` is djev's
+response body. Several requests batch into shared denoising blocks with
+`agent.PredictAsync(IReadOnlyList<DecisionRequest>)`, and `agent.Plan(request)` reports the reads, canvas
+widths and prompt lengths without running anything.
+
+What a read is: the questions become a system prompt; the answer is a template `0:A\n1:no\n2:0` after
+Gemma's empty thought block, rounded up to a 16-token canvas; the answer slots are filled with seeded
+noise; one denoising step later, each slot's distribution over its allowed label ids is the answer.
+Requests that cannot be answered that way - a label that is not one token, a template wider than the
+canvas, a prompt beyond the context, more than djev's limits - fail with `DecisionSchemaException` before
+any model work. A read that comes back without complete, valid evidence fails with
+`DecisionBackendException`; nothing is filled in.
+
+`IDecisionReader` is the whole model dependency (a tokenizer, the chat prompt, a batched one-step read), so
+the agent runs over anything that can provide it; `DiffusionGemmaReader` is the in-process one.
+
+## Benchmarking against JevBench
+
+`JevBenchSet` reads [jevbench](https://github.com/fstandhartinger/jevbench)'s public decisions from a
+checkout (hash-checked against its manifest), and `JevBenchRunner` sends each one the way jevbench's djev
+adapter does and scores it with jevbench's rules: accuracy per tier, chance-corrected Intelligence,
+Calibration from hard-tier ECE and gold distributions, p50/p95 Speed with jevbench's endpoint adjustment,
+and Cost per 1,000 decisions from the input tokens read. The receipt is a public-items estimate, never a
+JevBench Score - part of every tier is held out.
+
+```csharp
+var set = JevBenchSet.Load("/path/to/jevbench");
+JevBenchReport report = await new JevBenchRunner(agent).RunAsync(set);
+File.WriteAllText("jevbench.json", report.ToJson());
+```
+
+The command-line harness is [`benchmarks/DiffusionDecisionBench`](../benchmarks/DiffusionDecisionBench/README.md).
+
+## The JSON canvas (open-jev)
+
 Typed JSON decisions on a block-diffusion model. The model is never asked to write an
 answer that is then parsed — it is handed a canvas that can only hold answers, and the
 readout picks among them.
@@ -30,7 +128,7 @@ Every prediction is a complete, valid member of the request's allowed language. 
 no JSON repair, no retry and no second pass, and one denoising step answers every
 question about a document at once.
 
-## How the canvas works
+### How the canvas works
 
 1. **Tokenize every allowed answer as a complete JSON document.** Not a schema — the
    finite set of documents the answer may be.
@@ -65,7 +163,7 @@ enumerating their Cartesian product.
 - **Later readout decisions are not autoregressive.** They use the scores of the same
   diffusion pass, not likelihoods conditioned on the prefix just chosen.
 
-## Benchmarking
+### Benchmarking
 
 `StructuredBenchmark` measures what a decision service is actually judged on — accuracy
 against references, throughput, and cost — and writes a receipt that carries its own
@@ -107,7 +205,7 @@ has to add up to the questions asked. `Baseline` carries another system's answer
 scored on exactly the same questions — a comparison between two systems measured on
 different subsets is not one.
 
-## Evaluating against open-jev's public set
+### Evaluating against open-jev's public set
 
 open-jev ships the public evaluation materials it measured on. `OpenJevEvalSet` reads them
 into benchmark cases, resolving references the same way open-jev does — the consensus of a
@@ -133,7 +231,7 @@ JSON the dataset stores (a `{label: description}` object, or a list for a score)
 library aligns `Criteria` with `Options` and prints them as parallel arrays, so the prompts
 are worded differently even though the allowed values are identical.
 
-## Relationship to open-jev
+### Relationship to open-jev
 
 open-jev is the Python research harness for this idea on DiffusionGemma. This library is
 the same construction in the TensorSharp engine: a pinned JSON template, free answer slots,
@@ -147,7 +245,7 @@ Two differences are worth knowing:
   TensorSharp does the same by default, and `CanvasFit = Tight` instead compiles the canvas
   to the width the answers need and runs the forward there (see below).
 
-## Canvas width
+### Canvas width
 
 By default the answers are padded out to the model's served canvas with end-of-sequence
 tokens — the block the model was trained on. `CanvasFit = Tight` compiles the canvas to
@@ -172,7 +270,7 @@ positions ignored. The model sees a shorter block than the one it was trained on
 answer can move. Benchmark both fits on your own data and compare the accuracy, not only
 the throughput.
 
-## Using a different model
+### Using a different model
 
 `IStructuredReader` is the whole dependency: a tokenizer, the canvas geometry, and a way
 to denoise a batch of seeded canvases and report the scores at their free positions. It
