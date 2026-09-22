@@ -225,6 +225,157 @@ built-in skills / code-execution tools are never offered to this family either
 (the protocol entry declares `RendersToolDeclarations = false`), so `--code-exec`
 and skills discovery leave a diffusion request exactly as it was before.
 
+## 6a. Structured reads
+
+A discrete diffusion model denoises a whole canvas per forward pass. Seed the
+canvas with the answer's fixed text, leave only the slots you want read as
+noise, and one denoise step yields a distribution over each of those slots -
+a classifier, not a continuation. TensorSharp exposes that as a **read**.
+
+Three request fields carry it, named after the `extra_args` that vLLM accepts
+for the same model, so a schema layer written against either engine drives the
+other unchanged:
+
+| field | type | meaning |
+|---|---|---|
+| `diffusion_seed_canvas` | `int[]`, exactly the canvas width | replaces the random initial canvas after prefill |
+| `diffusion_canvas_length` | `int` | the canvas this request denoises, at most the served canvas (default: the served canvas). The forward runs at this width |
+| `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
+| `diffusion_read_only` | `bool` | emit the argmax canvas at the cap, end the request there, and report temperature-1 logprobs at every position |
+
+A read differs from a generation in three ways:
+
+- **It ends on the canvas it emits.** `MaxBlocks` is pinned to 1, and the
+  canvas is *not* trimmed at an end-of-turn token: the canvas is the answer, so
+  a stray end token drawn into a noise slot must not cut it short.
+- **It reports at temperature 1**, not at the step's place on the denoising
+  schedule. The schedule exists to make sampling converge; tempering the
+  reported numbers would rescale the very probabilities the caller asked for.
+  The argmax is the same either way, so the emitted canvas and the reported
+  distribution always agree on the most likely token.
+- **Its step cap is its own.** A read capped at one step leaves the batch after
+  that step even when a generation alongside it keeps denoising.
+
+Because only the full logits carry a distribution, a read that asks for
+logprobs stays on the host logits path rather than the on-device sampler (whose
+top-K is taken at the step's temperature). That is one readback per step, over
+the handful of steps a read runs. The top-K sweep itself runs once per read,
+on the step that emits.
+
+`diffusion_canvas_length` narrows the forward itself. Attention, the MoE and
+the lm_head all scale with the canvas width, so a request that knows its answer
+is short pays for its own canvas rather than the served one - and the emitted
+canvas, the logprobs and the readback all shrink with it.
+
+This is not only a cost knob. A 32-wide canvas is a 32-token block, not a
+256-token block with 224 positions ignored: the model sees a shorter block than
+the one it was trained on, and the answer can move. Narrow when the answer's
+length is known - a templated read - and measure the accuracy, not only the
+throughput. Free-text generation leaves it alone.
+
+### In-process
+
+```csharp
+var options = new DiffusionReadOptions
+{
+    ReadOnly = true,
+    MaxSteps = 1,
+    CanvasWidth = 16,
+    SeedCanvas = seedIds,   // exactly 16 ids
+    TopLogprobs = 20,
+};
+DiffusionReadResult read = await modelService.DiffusionReadAsync(
+    session, history, options, seed: 0, cancellationToken);
+```
+
+`DiffusionReadResult` carries the emitted `Canvas`, one
+`DiffusionPositionLogprobs` per position (token ids and natural log
+probabilities, most likely first), the steps actually run and whether the
+canvas converged rather than hitting its cap. `DiffusionGemmaSampler.Read`
+is the same thing one level down, against raw prompt tokens.
+
+### Over HTTP
+
+`POST /v1/diffusion/read`. Chat completions cannot carry this shape - there is
+no continuation and no finish reason, only per-position logprobs - so it has
+its own route.
+
+```bash
+curl -s localhost:8080/v1/diffusion/read -H 'content-type: application/json' -d '{
+  "messages": [
+    {"role": "system", "content": "{\"questions\": [{\"id\": \"urgent\", \"type\": \"noul\"}]}"},
+    {"role": "user", "content": "Everything is down and we have a demo at noon."}
+  ],
+  "diffusion_seed_canvas_text": "The answer is",
+  "diffusion_max_steps": 1,
+  "top_logprobs": 20,
+  "seed": 0
+}'
+```
+
+The seed canvas goes in as `diffusion_seed_canvas` (token ids) or
+`diffusion_seed_canvas_text` (tokenized server-side, `addSpecial: false`); give
+one, not both. A malformed read is a `400` with an `invalid_request_error`
+before anything reaches the sampler - an id outside the vocabulary is an
+out-of-bounds embedding lookup on the device, and a canvas whose length does not
+match its width would read back different slots than the caller wrote. The
+response is a `diffusion.read` object: the canvas as tokens and decoded text,
+`steps`, `converged`, and a `logprobs` array of `{position, top_logprobs}`.
+
+## 6b. Typed JSON decisions
+
+A read whose canvas is a JSON *template* turns the model into a classifier.
+Tokenize every allowed answer as a complete JSON document, pin the token
+positions all of them agree on - the braces, the quoted keys, the separators -
+and leave free only the positions where they differ. One denoise step later,
+the scores at those free positions choose among the allowed tokens, and the
+answer is a complete member of the allowed language by construction: no JSON
+repair, no retry, no second pass.
+
+[`TensorSharp.Structured`](../../TensorSharp.Structured/README.md) is that
+layer, with a benchmark harness for accuracy, throughput and cost. Its
+construction follows [open-jev](https://github.com/theolivenbaum/open-jev), the
+Python research harness for the same idea on this model, and its benchmark
+receipts use open-jev's field names so runs can be put side by side.
+
+`OpenJevEvalSet` reads open-jev's public evaluation materials straight into
+benchmark cases, resolving references the way open-jev does, so the same
+questions can be replayed here. The data is third-party and is not vendored:
+point the loader at a checkout. The importer reproduces open-jev's published
+shape exactly - 408 questions, 337 scorable, 54 without a reference, 17 tied,
+and its saved baseline at 90.8% - which is what makes a receipt produced here
+comparable to one produced there.
+
+```csharp
+var predictor = new StructuredPredictor(new DiffusionGemmaReader(model));
+StructuredPrediction answer = await predictor.PredictAsync(new StructuredRequest
+{
+    Document = "I was charged twice. Please refund the duplicate.",
+    Questions = new Dictionary<string, StructuredQuestion>
+    {
+        ["refund_requested"] = StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+        ["department"] = StructuredQuestion.Choice("Which team?", "billing", "technical", "sales"),
+    },
+});
+```
+
+Two read fields exist for it, on top of the structured-read contract above:
+
+| field | meaning |
+|---|---|
+| `PinnedPositions` | canvas positions held at their seed value for the whole denoise. A pinned position contributes no entropy and settles immediately - the cheap form of a logits mask allowing exactly one token there. Free positions denoise unrestricted. |
+| `LogprobTokenIds` | per position, the token ids to report the score of, instead of that position's top-K. A constrained readout needs the score of every *allowed* token at a slot, and an allowed token can sit far outside any top-K. |
+
+Where open-jev applies a `[canvas, vocab]` logits mask each step, TensorSharp
+pins positions: the same effect where it matters, without materializing the
+mask. open-jev always denoises the model's full 256-token canvas, padded with
+end-of-sequence tokens; `StructuredPredictOptions.CanvasFit = Tight` instead
+compiles the canvas to the width the answers need and runs the forward there.
+
+Questions on one canvas share attention, and a question set too large for one
+canvas is split and merged - so this does not isolate questions from one
+another.
+
 ## 7. Test coverage
 
 [`DiffusionGemmaTests`](../../InferenceWeb.Tests/DiffusionGemmaTests.cs) is
@@ -236,11 +387,120 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
 - Regression guards for repeated-token output and device-memory retention.
 - Batched decode equivalence and two-request generation through the scheduler
   style used by the server.
+- Structured reads: the emitted canvas and its per-position distribution, the
+  read's equivalence between the single-request and batched paths, and the
+  per-request step cap in a batch with a longer generation.
+- Typed JSON decisions: pinned positions holding through a multi-step denoise,
+  a prediction in its allowed language, a tight canvas answering for less, and
+  a benchmark receipt.
+- A narrow canvas costing less than the served one, which is the whole point of
+  a per-request width.
+
+[`OpenJevEvalSetTests`](../../InferenceWeb.Tests/OpenJevEvalSetTests.cs) replays
+open-jev's public evaluation set from a checkout named by `TS_OPEN_JEV_DIR`,
+pinning the importer against that project's published question counts and
+baseline accuracy; its last case needs a checkpoint too and produces a
+comparable receipt.
+
+[`DiffusionStructuredReadTests`](../../InferenceWeb.Tests/DiffusionStructuredReadTests.cs)
+needs no checkpoint and runs in ordinary CI: what a read is allowed to ask for
+(and the refusals), what it does to the sampler parameters, and the temperature-1
+top-K itself.
+
+[`StructuredDecisionTests`](../../InferenceWeb.Tests/StructuredDecisionTests.cs)
+also runs without a checkpoint: a character tokenizer compiles the canvases for
+real, and a scripted reader stands in for the denoise, so the canvas, the
+constrained readout, the canvas packing and the benchmark harness are exercised
+on their own terms.
+
+## 7a. Running the tests locally
+
+Most of this area's tests need no checkpoint and run in a normal `dotnet test`.
+The ones that do are gated on environment variables and **skip visibly** when
+they are unset, so a plain run is green without silently proving nothing.
+
+### Without a checkpoint
+
+```bash
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+    --filter "FullyQualifiedName~DiffusionStructuredReadTests|FullyQualifiedName~StructuredDecisionTests"
+```
+
+Covers what a read may ask for and the refusals, the temperature-1 top-K, the
+JSON canvas and its constrained readout, canvas packing and splitting, the tight
+canvas fit, and the benchmark harness including its OOM sweep and scoring.
+
+### With the checkpoint
+
+```bash
+hf download unsloth/diffusiongemma-26B-A4B-it-GGUF \
+    diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir models
+
+TS_TEST_MODEL_DIR=$PWD/models \
+TS_TEST_BACKEND=ggmlcuda \
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+    --filter "FullyQualifiedName~DiffusionGemmaTests"
+```
+
+`TS_TEST_MODEL_DIR` takes the directory (any GGUF whose name contains
+`diffusiongemma`, `diffusion-gemma`, `gemma-diffusion` or `gemmadiffusion`) or
+the file itself. `TS_TEST_BACKEND` is one of `ggmlcuda`, `ggmlmetal`, `ggmlcpu`,
+`cuda`, `cpu`, `mlx`; it defaults to `ggmlmetal` on macOS and `ggmlcpu`
+elsewhere. The CPU backend works and is slow — it runs the unified
+`[prompt|canvas]` forward rather than prefill + canvas decode.
+
+Two of these are timing comparisons (prompt-KV against the unified forward, a
+narrow canvas against the served one). Run them on an otherwise idle machine:
+under load they compare contended numbers and can fail on a build that is fine.
+
+### Replaying open-jev's evaluation set
+
+The data is third-party and is not vendored here, so point the tests at a
+checkout:
+
+```bash
+git clone https://github.com/theolivenbaum/open-jev /tmp/open-jev
+
+TS_OPEN_JEV_DIR=/tmp/open-jev \
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj \
+    --filter "FullyQualifiedName~OpenJevEvalSetTests"
+```
+
+Three of those four cases need no checkpoint: they pin the importer against
+open-jev's published question counts and baseline accuracy, which is what makes
+a receipt produced here comparable to one produced there. Add
+`TS_TEST_MODEL_DIR` and the fourth replays all 408 questions through the model
+and prints a receipt.
+
+### Trying the HTTP surface
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cuda
+
+curl -s localhost:5000/v1/diffusion/read -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Is the sky blue? Answer yes or no."}],
+  "diffusion_seed_canvas_text": "The answer is",
+  "diffusion_max_steps": 1,
+  "top_logprobs": 10,
+  "seed": 0
+}'
+```
+
+The canvas width comes from the checkpoint (`diffusion.canvas_length`, 256 for
+this one); there is no flag for it. A request narrows its own canvas with
+`diffusion_canvas_length`, which is what
+[`TensorSharp.Structured`](../../TensorSharp.Structured/README.md)'s tight
+canvas fit does.
 
 ## 8. Remaining work
 
 - Add dedicated API examples once Ollama/OpenAI adapters grow a diffusion-aware
   compatibility surface.
+- Publish an accuracy comparison between a tight canvas and the served one on a
+  real checkpoint, so `diffusion_canvas_length` can be recommended rather than
+  only offered. `OpenJevEvalSet` plus `StructuredBenchmarkOptions.CanvasFit` is
+  the harness for it; what is missing is a GPU run.
 - Promote true batched canvas decode only if it wins on target GPUs; today the
   fused single-canvas path can be faster when one canvas already saturates the
   GPU.

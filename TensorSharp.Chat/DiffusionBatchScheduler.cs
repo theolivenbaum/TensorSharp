@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -28,10 +28,16 @@ namespace TensorSharp.Server
         public ChannelReader<DiffusionPreview> Previews { get; }
         public Task<List<int>> Completion { get; }
 
-        public DiffusionRequestHandle(ChannelReader<DiffusionPreview> previews, Task<List<int>> completion)
+        /// <summary>The structured read this request produced: the emitted canvas and its per-position
+        /// distributions. Completes with null for an ordinary generation.</summary>
+        public Task<DiffusionReadResult> Read { get; }
+
+        public DiffusionRequestHandle(ChannelReader<DiffusionPreview> previews, Task<List<int>> completion,
+            Task<DiffusionReadResult> read)
         {
             Previews = previews;
             Completion = completion;
+            Read = read;
         }
     }
 
@@ -91,18 +97,21 @@ namespace TensorSharp.Server
                 SingleWriter = false,   // the worker writes; completion may race the writer
             });
             var tcs = new TaskCompletionSource<List<int>>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var req = new PendingRequest(promptTokens, p, ct, channel, tcs);
+            var readTcs = new TaskCompletionSource<DiffusionReadResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var req = new PendingRequest(promptTokens, p, ct, channel, tcs, readTcs);
 
             if (_stop.IsCancellationRequested)
             {
                 tcs.TrySetCanceled(ct);
+                readTcs.TrySetCanceled(ct);
                 channel.Writer.TryComplete();
-                return new DiffusionRequestHandle(channel.Reader, tcs.Task);
+                return new DiffusionRequestHandle(channel.Reader, tcs.Task, readTcs.Task);
             }
 
             lock (_pendingLock) { _pending.Enqueue(req); }
             _signal.Release();
-            return new DiffusionRequestHandle(channel.Reader, tcs.Task);
+            return new DiffusionRequestHandle(channel.Reader, tcs.Task, readTcs.Task);
         }
 
         private void WorkerLoop()
@@ -141,6 +150,7 @@ namespace TensorSharp.Server
                         foreach (var x in active)
                         {
                             x.Req.Tcs.TrySetException(ex);
+                            x.Req.ReadTcs.TrySetException(ex);
                             x.Req.Channel.Writer.TryComplete(ex);
                             SafeDispose(x.Run.State);
                         }
@@ -156,8 +166,16 @@ namespace TensorSharp.Server
                         bool cancelled = x.Req.Ct.IsCancellationRequested;
                         if (x.Run.Done || cancelled)
                         {
-                            if (cancelled) x.Req.Tcs.TrySetCanceled(x.Req.Ct);
-                            else x.Req.Tcs.TrySetResult(x.Run.Response);
+                            if (cancelled)
+                            {
+                                x.Req.Tcs.TrySetCanceled(x.Req.Ct);
+                                x.Req.ReadTcs.TrySetCanceled(x.Req.Ct);
+                            }
+                            else
+                            {
+                                x.Req.Tcs.TrySetResult(x.Run.Response);
+                                x.Req.ReadTcs.TrySetResult(x.Run.ReadResult);
+                            }
                             x.Req.Channel.Writer.TryComplete();
                             SafeDispose(x.Run.State);
                             active.RemoveAt(i);
@@ -171,6 +189,7 @@ namespace TensorSharp.Server
                 foreach (var x in active)
                 {
                     x.Req.Tcs.TrySetCanceled();
+                    x.Req.ReadTcs.TrySetCanceled();
                     x.Req.Channel.Writer.TryComplete();
                     SafeDispose(x.Run.State);
                 }
@@ -180,6 +199,7 @@ namespace TensorSharp.Server
                     {
                         var r = _pending.Dequeue();
                         r.Tcs.TrySetCanceled();
+                        r.ReadTcs.TrySetCanceled();
                         r.Channel.Writer.TryComplete();
                     }
                 }
@@ -197,6 +217,7 @@ namespace TensorSharp.Server
                     if (req.Ct.IsCancellationRequested)
                     {
                         req.Tcs.TrySetCanceled(req.Ct);
+                        req.ReadTcs.TrySetCanceled(req.Ct);
                         req.Channel.Writer.TryComplete();
                         continue;
                     }
@@ -241,15 +262,18 @@ namespace TensorSharp.Server
             public CancellationToken Ct { get; }
             public Channel<DiffusionPreview> Channel { get; }
             public TaskCompletionSource<List<int>> Tcs { get; }
+            public TaskCompletionSource<DiffusionReadResult> ReadTcs { get; }
 
             public PendingRequest(int[] promptTokens, DiffusionEbParams p, CancellationToken ct,
-                Channel<DiffusionPreview> channel, TaskCompletionSource<List<int>> tcs)
+                Channel<DiffusionPreview> channel, TaskCompletionSource<List<int>> tcs,
+                TaskCompletionSource<DiffusionReadResult> readTcs)
             {
                 PromptTokens = promptTokens;
                 Params = p;
                 Ct = ct;
                 Channel = channel;
                 Tcs = tcs;
+                ReadTcs = readTcs;
             }
         }
 

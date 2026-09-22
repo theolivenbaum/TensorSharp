@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -21,6 +21,7 @@ using TensorSharp;
 using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Structured;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -63,21 +64,7 @@ public class DiffusionGemmaTests
         }
         // Exercise the GPU path on macOS (ggml_metal), CPU elsewhere. TS_TEST_BACKEND overrides
         // (e.g. ggmlcuda on a Windows/Linux CUDA box), mirroring TS_REPRO_BACKEND elsewhere.
-        BackendType backend = OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu;
-        string backendEnv = Environment.GetEnvironmentVariable("TS_TEST_BACKEND");
-        if (!string.IsNullOrWhiteSpace(backendEnv))
-        {
-            backend = backendEnv.ToLowerInvariant() switch
-            {
-                "cpu" => BackendType.Cpu,
-                "cuda" => BackendType.Cuda,
-                "ggmlcpu" => BackendType.GgmlCpu,
-                "ggmlcuda" => BackendType.GgmlCuda,
-                "ggmlmetal" => BackendType.GgmlMetal,
-                "mlx" => BackendType.Mlx,
-                _ => backend,
-            };
-        }
+        BackendType backend = TestGates.PreferredTestBackend;
         _output.WriteLine($"[diffusion-gemma] loading {Path.GetFileName(modelPath)} on {backend}");
         _loadedBackend = backend;
         var model = (DiffusionGemmaModel)ModelBase.Create(modelPath, backend);
@@ -691,6 +678,388 @@ public class DiffusionGemmaTests
         _output.WriteLine($"[diffusion-gemma][batched] pkv={model.SupportsPromptKvCache} " +
             $"solo={solo.Count} tokens, batched={run.Response.Count} tokens");
         Assert.Equal(solo, run.Response);
+    }
+
+    // ---- Structured reads --------------------------------------------------
+    //
+    // A read seeds the canvas with the answer's fixed text, leaves the slots it wants read as noise and
+    // denoises for a bounded number of steps; what it wants back is the distribution over each slot, not
+    // a continuation. These pin the shape of that contract against a real model - the numbers themselves
+    // belong to the checkpoint, so what is asserted is what a caller can rely on regardless of it.
+
+    /// <summary>Seed the first <paramref name="width"/> canvas positions with a short answer template,
+    /// with the last position left as an out-of-template token to stand for the slot being read.</summary>
+    private int[] SeedTemplate(DiffusionGemmaModel model, int width)
+    {
+        var ids = model.Tokenizer.Encode("The answer is", addSpecial: false);
+        var seed = new int[width];
+        for (int i = 0; i < width; i++) seed[i] = ids[i % ids.Count];
+        return seed;
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_EmitsTheWholeSeededCanvas_WithATemperatureOneDistributionPerSlot()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        int width = Math.Min(8, model.CanvasLength);
+        var prompt = RenderPrompt(model, "Is the sky blue? Answer yes or no.");
+        var options = new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 1,
+            CanvasWidth = width,
+            SeedCanvas = SeedTemplate(model, width),
+            TopLogprobs = 8,
+        };
+        options.Validate(model.CanvasLength, model.VocabSize);
+
+        var p = FixedStepParams(48);
+        options.ApplyTo(p, model.CanvasLength);
+        Assert.Equal(1, p.MaxDenoisingSteps);   // the read's cap wins over the sampler default
+
+        var result = new DiffusionGemmaSampler(model).Read(prompt, p);
+
+        // One canvas is the whole output: emitted at the cap, untrimmed, exactly as wide as asked for.
+        Assert.Equal(width, result.Canvas.Length);
+        Assert.Equal(1, result.StepsRun);
+        Assert.False(result.Converged);
+        Assert.Equal(width, result.Logprobs.Count);
+
+        for (int pos = 0; pos < width; pos++)
+        {
+            var lp = result.Logprobs[pos];
+            Assert.Equal(8, lp.TokenIds.Length);
+            // The emitted canvas is the argmax canvas, so the distribution has to lead with it.
+            Assert.Equal(result.Canvas[pos], lp.TokenIds[0]);
+            double mass = 0;
+            for (int i = 0; i < lp.Logprobs.Length; i++)
+            {
+                Assert.True(lp.Logprobs[i] <= 0f, $"logprob {lp.Logprobs[i]} at slot {pos} is not a logprob");
+                if (i > 0) Assert.True(lp.Logprobs[i] <= lp.Logprobs[i - 1], "top-k is not ranked");
+                mass += Math.Exp(lp.Logprobs[i]);
+            }
+            Assert.True(mass <= 1.0 + 1e-3, $"top-8 mass {mass:F4} at slot {pos} exceeds 1");
+        }
+        _output.WriteLine($"[diffusion-gemma][read] canvas: {model.Tokenizer.Decode(new List<int>(result.Canvas))}");
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_ThroughTheBatchedScheduler_MatchesTheSingleRequestPath()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        int width = Math.Min(8, model.CanvasLength);
+        var prompt = RenderPrompt(model, "Is the sky blue? Answer yes or no.");
+        var p = FixedStepParams(2);
+        new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 2,
+            CanvasWidth = width,
+            SeedCanvas = SeedTemplate(model, width),
+            TopLogprobs = 4,
+        }.ApplyTo(p, model.CanvasLength);
+
+        var solo = new DiffusionGemmaSampler(model).Read(prompt, p);
+
+        var run = new DiffusionSeqRun(prompt, p, model.CreateSeqState(), CancellationToken.None, null);
+        try
+        {
+            new DiffusionGemmaSampler(model).RunBlockBatched(new List<DiffusionSeqRun> { run });
+        }
+        finally
+        {
+            model.DisposeSeqState(run.State);
+        }
+
+        Assert.True(run.Done);                       // a read never asks for a second block
+        Assert.NotNull(run.ReadResult);
+        Assert.Equal(solo.Canvas, run.ReadResult.Canvas);
+        Assert.Equal(solo.StepsRun, run.ReadResult.StepsRun);
+        Assert.Equal(width, run.Response.Count);     // untrimmed: the canvas IS the answer
+        for (int pos = 0; pos < width; pos++)
+            Assert.Equal(solo.Logprobs[pos].TokenIds, run.ReadResult.Logprobs[pos].TokenIds);
+    }
+
+    // A read capped at one step used to keep denoising to the LONGEST request in the batch, emitting a
+    // canvas it never asked for (and, past its cap, on a temperature schedule run off its end). The cap
+    // is per request, so the read has to leave the batch while the generation carries on.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_LeavesTheBatchAtItsOwnStepCap()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+        if (!model.SupportsPromptKvCache)
+        {
+            _output.WriteLine("[diffusion-gemma][read] CPU backend; skipping mixed-batch test");
+            return;
+        }
+
+        int width = Math.Min(8, model.CanvasLength);
+        var readParams = FixedStepParams(48);
+        new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 1,
+            CanvasWidth = width,
+            SeedCanvas = SeedTemplate(model, width),
+        }.ApplyTo(readParams, model.CanvasLength);
+
+        var read = new DiffusionSeqRun(RenderPrompt(model, "Is the sky blue? Answer yes or no."),
+            readParams, model.CreateSeqState(), CancellationToken.None, null);
+        var generation = new DiffusionSeqRun(RenderPrompt(model, "What is the capital of France?"),
+            FixedStepParams(4), model.CreateSeqState(), CancellationToken.None, null);
+        try
+        {
+            new DiffusionGemmaSampler(model).RunBlockBatched(new List<DiffusionSeqRun> { read, generation });
+        }
+        finally
+        {
+            model.DisposeSeqState(read.State);
+            model.DisposeSeqState(generation.State);
+        }
+
+        Assert.Equal(1, read.ReadResult.StepsRun);
+        Assert.True(generation.Response.Count > 0, "the longer request was cut short with the read");
+    }
+
+    // ---- Typed JSON decisions ----------------------------------------------
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void PinnedCanvasPositions_HoldTheirSeedValueForTheWholeDenoise()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        // Pin every other position to a fixed token and let the rest denoise. This is what keeps a
+        // templated canvas's scaffolding intact while its answer slots move.
+        int width = model.CanvasLength;
+        int pinnedToken = model.Tokenizer.Encode("a", addSpecial: false)[0];
+        var seed = new int[width];
+        var pins = new bool[width];
+        for (int i = 0; i < width; i++) { seed[i] = pinnedToken; pins[i] = i % 2 == 0; }
+
+        var p = FixedStepParams(3);
+        new DiffusionReadOptions
+        {
+            ReadOnly = true,
+            MaxSteps = 3,
+            SeedCanvas = seed,
+            PinnedPositions = pins,
+        }.ApplyTo(p, model.CanvasLength);
+
+        var result = new DiffusionGemmaSampler(model).Read(
+            RenderPrompt(model, "Write a short sentence."), p);
+
+        Assert.Equal(3, result.StepsRun);
+        for (int i = 0; i < width; i++)
+        {
+            if (pins[i]) Assert.Equal(pinnedToken, result.Canvas[i]);
+        }
+        // …and the free half really did denoise: a canvas that came back all-pinned would pass the loop
+        // above while proving nothing.
+        Assert.Contains(Enumerable.Range(0, width).Where(i => !pins[i]),
+            i => result.Canvas[i] != pinnedToken);
+    }
+
+    // The read's canvas width is what the forward runs at - attention, the MoE and the lm_head all scale
+    // with it - so a short templated answer must not pay for the served canvas. This used to be the case:
+    // a narrow request kept denoising the full canvas and simply ignored the tail.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void ANarrowCanvasCostsLessThanTheServedOne()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        int narrow = Math.Max(8, model.CanvasLength / 8);
+        var prompt = RenderPrompt(model, "What is the capital of France?");
+        var sampler = new DiffusionGemmaSampler(model);
+
+        double Time(int width)
+        {
+            var p = FixedStepParams(2);
+            new DiffusionReadOptions { ReadOnly = true, MaxSteps = 2, CanvasWidth = width }
+                .ApplyTo(p, model.CanvasLength);
+            sampler.Read(prompt, p);                 // warm this width's masks and graphs
+            var sw = Stopwatch.StartNew();
+            var result = sampler.Read(prompt, p);
+            sw.Stop();
+            Assert.Equal(width, result.Canvas.Length);
+            return sw.Elapsed.TotalMilliseconds;
+        }
+
+        double wide = Time(model.CanvasLength);
+        double thin = Time(narrow);
+        _output.WriteLine($"[diffusion-gemma][width] {model.CanvasLength}-wide={wide:F0}ms " +
+            $"{narrow}-wide={thin:F0}ms speedup={wide / thin:F2}x");
+
+        Assert.True(thin < wide,
+            $"a {narrow}-wide canvas ({thin:F0}ms) was not cheaper than a " +
+            $"{model.CanvasLength}-wide one ({wide:F0}ms)");
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public async Task ATightStructuredCanvas_AnswersTheSameQuestionsForLess()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var request = new StructuredRequest
+        {
+            Id = "refund",
+            Document = "I was charged twice for the same order. Please refund the duplicate.",
+            Questions = new Dictionary<string, StructuredQuestion>
+            {
+                ["refund_requested"] = StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+            },
+        };
+        var predictor = new StructuredPredictor(new DiffusionGemmaReader(model));
+        var requests = new[] { request };
+
+        int served = predictor.PlanCanvasWidths(requests)[0];
+        int tight = predictor.PlanCanvasWidths(requests, JsonCanvasFit.Tight)[0];
+        Assert.Equal(model.CanvasLength, served);
+        Assert.True(tight < served);
+
+        var prediction = await predictor.PredictAsync(request, new StructuredPredictOptions
+        {
+            Steps = 1,
+            Seed = 0,
+            CanvasFit = JsonCanvasFit.Tight,
+        });
+
+        _output.WriteLine($"[diffusion-gemma][structured] tight canvas {tight} (served {served}): " +
+            prediction.Json);
+        // Narrower forward, same contract: a complete answer in the allowed language.
+        Assert.Contains(request.Questions["refund_requested"].Options,
+            o => System.Text.Json.JsonSerializer.Serialize(o)
+                == System.Text.Json.JsonSerializer.Serialize(prediction.Values["refund_requested"]));
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public async Task StructuredDecision_AnswersEveryQuestion_InItsAllowedLanguage()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var reader = new DiffusionGemmaReader(model);
+        var predictor = new StructuredPredictor(reader);
+        var requests = new[]
+        {
+            new StructuredRequest
+            {
+                Id = "refund",
+                Document = "I was charged twice for the same order. Please refund the duplicate.",
+                Questions = new Dictionary<string, StructuredQuestion>
+                {
+                    ["refund_requested"] = StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+                    ["department"] = StructuredQuestion.Choice(
+                        "Which team should handle this?", "billing", "technical", "sales"),
+                },
+            },
+            new StructuredRequest
+            {
+                Id = "outage",
+                Document = "The dashboard has been down for an hour and our demo is at noon.",
+                Questions = new Dictionary<string, StructuredQuestion>
+                {
+                    ["urgent"] = StructuredQuestion.Boolean("Does this need a reply within the hour?"),
+                    ["severity"] = StructuredQuestion.Score("How severe is this?", "low", "medium", "high"),
+                },
+            },
+        };
+
+        var predictions = await predictor.PredictAsync(
+            requests, new StructuredPredictOptions { Steps = 1, Seed = 0, BatchSize = 2 });
+
+        Assert.Equal(2, predictions.Count);
+        foreach (var (request, prediction) in requests.Zip(predictions))
+        {
+            _output.WriteLine($"[diffusion-gemma][structured] {prediction.Id}: {prediction.Json}");
+            Assert.Equal(request.Id, prediction.Id);
+            Assert.Equal(1, prediction.Canvases);
+            // The point of the canvas: the answer is a complete member of the allowed language, always.
+            var json = System.Text.Json.Nodes.JsonNode.Parse(prediction.Json)!.AsObject();
+            Assert.Equal(request.Questions.Keys, json.Select(x => x.Key));
+            foreach (var (key, question) in request.Questions)
+            {
+                object? value = prediction.Values[key];
+                Assert.Contains(question.Options,
+                    o => System.Text.Json.JsonSerializer.Serialize(o)
+                        == System.Text.Json.JsonSerializer.Serialize(value));
+                var answer = prediction.Fields[key];
+                Assert.Equal(question.Options.Count, answer.OptionProbabilities.Count);
+                Assert.Equal(1.0, answer.OptionProbabilities.Sum(), 4);
+                // The reported confidence belongs to the value that was chosen.
+                Assert.Equal(answer.OptionProbabilities.Max(), answer.Probability, 6);
+            }
+        }
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public async Task StructuredBenchmark_ProducesAReceiptWithThroughputAndAccuracy()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var cases = new[]
+        {
+            new StructuredBenchmarkCase
+            {
+                Workflow = "refunds",
+                Request = new StructuredRequest
+                {
+                    Id = "duplicate-charge",
+                    Document = "I was charged twice for the same order. Please refund the duplicate.",
+                    Questions = new Dictionary<string, StructuredQuestion>
+                    {
+                        ["refund_requested"] =
+                            StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+                    },
+                },
+                Expected = new Dictionary<string, object?> { ["refund_requested"] = true },
+            },
+            new StructuredBenchmarkCase
+            {
+                Workflow = "refunds",
+                Request = new StructuredRequest
+                {
+                    Id = "how-to",
+                    Document = "How do I export my invoices as a spreadsheet?",
+                    Questions = new Dictionary<string, StructuredQuestion>
+                    {
+                        ["refund_requested"] =
+                            StructuredQuestion.Boolean("Does the customer ask for a refund?"),
+                    },
+                },
+                Expected = new Dictionary<string, object?> { ["refund_requested"] = false },
+            },
+        };
+
+        var benchmark = new StructuredBenchmark(
+            new StructuredPredictor(new DiffusionGemmaReader(model)));
+        var report = await benchmark.RunAsync(cases, new StructuredBenchmarkOptions
+        {
+            BatchSizes = new[] { 2, 1 },
+            Steps = 1,
+            Repeats = 2,
+            Warmups = 1,
+            DeviceUsdPerSecond = 0.001097,
+            PricingSource = "illustrative; not this machine",
+        });
+
+        _output.WriteLine(report.ToJson());
+        var summary = Assert.Single(report.Summaries);
+        Assert.Equal(4, summary.DocumentsMeasured);
+        Assert.True(summary.DocumentsPerSecond > 0);
+        Assert.Equal(2, summary.Scored);
+        // The same seed on the same documents has to answer the same way twice.
+        Assert.Equal(0, summary.InconsistentRepeatedDocuments);
+        _output.WriteLine($"[diffusion-gemma][structured] accuracy={summary.Accuracy} " +
+            $"docs/s={summary.DocumentsPerSecond:F2}");
     }
 
     /// <summary>Drive two prompts through the batched sampler to completion (block-synchronous, as the

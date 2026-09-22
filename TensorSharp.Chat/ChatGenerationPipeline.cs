@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -980,6 +980,68 @@ namespace TensorSharp.Server
                 finalThinking);
             yield return new DiffusionStreamUpdate("", IsPreview: false, Done: true, 0, 0,
                 promptTokenCount, generated.Count, totalNs);
+        }
+
+        /// <summary>
+        /// Run a structured read against DiffusionGemma: seed the canvas with the answer's fixed text,
+        /// leave the slots to be read as noise, denoise for a bounded number of steps and return the
+        /// canvas the model settled on together with its per-position distribution.
+        ///
+        /// This is the request-level half of the same contract vLLM exposes on this model through the
+        /// <c>diffusion_seed_canvas</c> / <c>diffusion_max_steps</c> / <c>diffusion_read_only</c> fields,
+        /// so a schema layer written against either engine drives the other unchanged. The read shares the
+        /// continuous-batching scheduler with ordinary chat turns, so it neither blocks nor is blocked by
+        /// generation in flight.
+        /// </summary>
+        /// <param name="session">The session whose transcript conditions the read; null uses a scratch one.</param>
+        /// <param name="history">The messages to render as the read's prompt.</param>
+        /// <param name="options">The read. <see cref="DiffusionReadOptions.ReadOnly"/> is implied.</param>
+        /// <param name="seed">Noise seed; null draws one. Fixing it makes a read reproducible.</param>
+        /// <param name="cancellationToken">Abandons the read between denoising steps.</param>
+        public async Task<DiffusionReadResult> DiffusionReadAsync(
+            ChatSession session,
+            List<ChatMessage> history,
+            DiffusionReadOptions options,
+            int? seed = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (options == null) throw new ArgumentNullException(nameof(options));
+            session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
+            var model = (DiffusionGemmaModel)(_lifecycle.Model
+                ?? throw new InvalidOperationException("No model is loaded."));
+
+            // A read emits one canvas and ends there, whatever the caller left the flag at.
+            options.ReadOnly = true;
+            options.Validate(model.CanvasLength, model.VocabSize);
+
+            string arch = model.Config.Architecture;
+            var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
+            List<ChatMessage> renderHistory;
+            lock (session.HistoryLock)
+                renderHistory = session.Transcripts.Augment(preparedHistory).History;
+
+            using var scope = _telemetry.BeginInferenceScope(
+                session, _lifecycle.LoadedModelName, _lifecycle.LoadedBackend, "diffusion.read");
+
+            List<int> inputTokens = _kvCacheRenderer.RenderToTokens(
+                model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
+                addGenerationPrompt: true, out _, out _, tools: null, enableThinking: false);
+            inputTokens = TruncatePromptToContext(
+                session, inputTokens, model.CanvasLength, out _,
+                preserveAllInput: HasTextFileAttachments(renderHistory));
+
+            var ebParams = new DiffusionEbParams
+            {
+                MaxDenoisingSteps = DiffusionMaxSteps,
+                Seed = seed ?? Random.Shared.Next(),
+                MaxBlocks = 1,
+            };
+            options.ApplyTo(ebParams, model.CanvasLength);
+
+            var handle = GetDiffusionScheduler(model).Submit(
+                inputTokens.ToArray(), ebParams, cancellationToken);
+            await handle.Completion.ConfigureAwait(false);
+            return await handle.Read.ConfigureAwait(false);
         }
 
         /// <summary>

@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -417,6 +417,23 @@ namespace TensorSharp.Server
             bool enableThinking = false)
         {
             return _generation.DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken, enableThinking);
+        }
+
+        /// <summary>Run a structured read against the loaded DiffusionGemma model: a seeded canvas
+        /// denoised for a bounded number of steps, returned with the model's distribution over every
+        /// canvas position. See <see cref="ChatGenerationPipeline.DiffusionReadAsync"/>.</summary>
+        /// <exception cref="InvalidOperationException">The loaded model is not a diffusion model.</exception>
+        public virtual System.Threading.Tasks.Task<DiffusionReadResult> DiffusionReadAsync(
+            ChatSession session,
+            List<ChatMessage> history,
+            DiffusionReadOptions options,
+            int? seed = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (!IsDiffusionModel)
+                throw new InvalidOperationException(
+                    "Structured reads need a block-diffusion model; the loaded model generates autoregressively.");
+            return _generation.DiffusionReadAsync(session, history, options, seed, cancellationToken);
         }
 
         /// <summary>
