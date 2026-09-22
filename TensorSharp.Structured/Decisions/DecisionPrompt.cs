@@ -23,6 +23,12 @@ namespace TensorSharp.Structured.Decisions
     /// carry a space before the system turn's <c>&lt;turn|&gt;</c> that a string-content render does not. A
     /// chat message here is a string, so the render is corrected to the content-part spelling; the user
     /// turn is <c>trim(text)</c> either way.
+    ///
+    /// Templates also differ by revision. The canonical Gemma 4 template djev pins ends the prompt at
+    /// <c>&lt;|turn&gt;model\n</c>, and djev writes the empty thought block
+    /// (<c>&lt;|channel&gt;thought\n&lt;channel|&gt;</c>) onto the canvas. Older revisions - the ones several
+    /// published GGUFs embed - append that block to the prompt when thinking is off, which would put it there
+    /// twice. It is removed from the prompt: the canvas carries it, as in djev.
     /// </summary>
     public static class DecisionPrompt
     {
@@ -39,7 +45,18 @@ namespace TensorSharp.Structured.Decisions
             };
             string rendered = Renderer.Render(chatTemplate, messages,
                 addGenerationPrompt: true, architecture: architecture, enableThinking: false);
-            return AsContentParts(rendered, system);
+            return WithoutPromptThoughtBlock(AsContentParts(rendered, system));
+        }
+
+        private const string GenerationBoundary = "<|turn>model\n";
+
+        /// <summary>Drop an empty thought block an older template put after the generation boundary.</summary>
+        internal static string WithoutPromptThoughtBlock(string rendered)
+        {
+            string primed = GenerationBoundary + DecisionSchemaCompiler.Scaffold;
+            return rendered.EndsWith(primed, StringComparison.Ordinal)
+                ? rendered[..^DecisionSchemaCompiler.Scaffold.Length]
+                : rendered;
         }
 
         /// <summary>Respell a string-content system turn as the content-part one djev renders.</summary>

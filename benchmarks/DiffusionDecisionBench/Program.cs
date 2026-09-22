@@ -37,6 +37,7 @@ try
         "bench" => await Bench(options),
         "jevbench" => await JevBench(options),
         "plan" => Plan(options),
+        "probe" => await Probe(options),
         "presets" => ListPresets(),
         _ => Help(),
     };
@@ -64,6 +65,7 @@ static int Help()
           jevbench   --jevbench <checkout> [--splits easy,original,hard] [--limit N] [--out receipt.json]
                      [--pacing serial|batched] [--price-per-m 0.035] [--device-usd-per-hour X] [--endpoint gpu]
           plan       --jevbench <checkout> [--splits ...]   reads, canvas widths and prompt tokens, no reads run
+          probe      same inputs as predict: the model's top tokens at every canvas position of a joint read
           presets    list the built-in question sets
 
         model:       --model <file.gguf> [--backend ggmlcuda|ggmlmetal|ggmlcpu|cuda|cpu|mlx]  or  --mock
@@ -223,6 +225,37 @@ static async Task<int> Bench(CommandLine options)
         "median {0:F1} ms, {1:F1} ms/question ({2}, {3})",
         median, median / Math.Max(1, request.Questions.Count), agent.ModelName,
         request.Options.Isolation == DecisionIsolation.Joint ? "joint" : "independent"));
+    return 0;
+}
+
+// What the model puts at each canvas position of the joint read, top-K at temperature 1: the check for a read
+// whose label mass is low - is the slot predicting a label at all, or something else entirely?
+static async Task<int> Probe(CommandLine options)
+{
+    DecisionRequest request = ReadRequest(options);
+    using DiffusionAgent agent = OpenAgent(options);
+    CompiledDecisionSchema schema = agent.Compile(request.Questions);
+    int[] prompt = agent.Reader.EncodeChat(schema.SystemPrompt, DecisionSchemaCompiler.Describe(request.State));
+    int[] canvas = DecisionSchemaCompiler.SeedCanvas(schema, request.Options.Seed ?? 0, agent.Reader.VocabSize);
+    int k = options.Int("top") ?? 5;
+    var read = new DecisionRead
+    {
+        PromptTokens = prompt,
+        Options = new TensorSharp.Models.DiffusionReadOptions
+        {
+            ReadOnly = true, MaxSteps = 1, CanvasWidth = schema.CanvasWidth, SeedCanvas = canvas, TopLogprobs = k,
+        },
+    };
+    var result = (await agent.Reader.ReadAsync(new[] { read }))[0];
+    string Show(int id) => JsonSerializer.Serialize(agent.Reader.Tokenizer.Decode(new List<int> { id }));
+    Console.WriteLine($"prompt {prompt.Length} tokens; tail: {JsonSerializer.Serialize(agent.Reader.Tokenizer.Decode(prompt.TakeLast(12).ToList()))}");
+    var slots = schema.Slots.Select(s => s.Position).ToHashSet();
+    for (int pos = 0; pos < canvas.Length; pos++)
+    {
+        var lp = result.Logprobs[pos];
+        string top = string.Join("  ", lp.TokenIds.Select((id, i) => $"{Show(id)} {Math.Exp(lp.Logprobs[i]):F3}"));
+        Console.WriteLine($"{pos,3}{(slots.Contains(pos) ? "*" : " ")} seed {Show(canvas[pos]),-16} -> {top}");
+    }
     return 0;
 }
 

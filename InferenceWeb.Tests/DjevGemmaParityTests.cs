@@ -74,6 +74,9 @@ public class DjevGemmaParityTests
     {
         Assert.Equal("<|turn>system\nrules <turn|>\n<|turn>user\nhi<turn|>\n",
             DecisionPrompt.AsContentParts("<|turn>system\nrules<turn|>\n<|turn>user\nhi<turn|>\n", "  rules\n"));
+        // An older template's prompt-side empty thought block goes: djev writes it on the canvas.
+        Assert.Equal("x<|turn>model\n", DecisionPrompt.WithoutPromptThoughtBlock("x<|turn>model\n<|channel>thought\n<channel|>"));
+        Assert.Equal("x<|turn>model\n", DecisionPrompt.WithoutPromptThoughtBlock("x<|turn>model\n"));
         // A render that does not have the shape is left alone rather than guessed at.
         Assert.Equal("<|im_start|>system\nrules<|im_end|>", DecisionPrompt.AsContentParts("<|im_start|>system\nrules<|im_end|>", "rules"));
     }

@@ -54,7 +54,11 @@ built on top of it.
 5. **No evidence checks.** djev fails a read that omits a requested label, reports NaN, +∞ or a positive
    log-probability, or has no finite label at all, and treats vLLM's −9999 as impossible rather than as
    evidence. The JSON readout took whatever the scores were. `DiffusionAgent` applies djev's checks.
-6. **Images.** djev reads state, question and option images natively. TensorSharp's DiffusionGemma is
+6. **GGUF templates are older than djev's.** The Gemma 4 template embedded in published DiffusionGemma
+   GGUFs predates the canonical 2026-07-09 revision djev pins, and with thinking off it appends
+   `<|channel>thought\n<channel|>` to the prompt - the block djev writes onto the canvas instead. Left in,
+   it would appear twice. `DecisionPrompt` drops it from the prompt.
+7. **Images.** djev reads state, question and option images natively. TensorSharp's DiffusionGemma is
    text-only, so an image anywhere in a request is refused (422), as djev's text-only base engine does.
 
 ## What is reproduced, and how it is checked
@@ -82,7 +86,7 @@ The constants djev hard-codes hold for this vocabulary: 106 is `<turn|>`, 0 is `
 ## What still differs
 
 - **Arithmetic.** djev serves BF16 weights and a BF16 KV cache on vLLM; a GGUF here is usually quantized
-  (Q4_K_M is the smallest), on different kernels. Same prompt, same canvas, different logits: expect the
+  (unsloth publishes Q4_K_M and up; community Q2_K and Q3_K_M exist), on different kernels. Same prompt, same canvas, different logits: expect the
   probabilities to move and some answers to flip. Neither side promises bitwise repeatability.
 - **Batching.** djev bounds concurrent reads and relies on vLLM's scheduler; here a batch of reads is one
   denoising block (`DiffusionAgentOptions.BatchSize`, or the server's diffusion scheduler). The arithmetic
@@ -90,6 +94,26 @@ The constants djev hard-codes hold for this vocabulary: 106 is `<turn|>`, 0 is `
 - **Prefix caching.** djev reuses eligible KV prefixes across requests. TensorSharp prefills each read's
   prompt; answers are unaffected, latency is.
 - **Images**, as above.
+
+## First run on a real checkpoint (CPU, Q2_K)
+
+The only DiffusionGemma GGUF that fits a 15 GB, 4-core, GPU-less VM is DevQuasar's Q2_K (10.6 GB; the
+smallest official quant, Q4_K_M, is 16.8 GB). On it, with ggml_cpu and AVX-512:
+
+| request | prompt tokens | canvas | warm time |
+|---|---:|---:|---:|
+| one Noul question | 125 | 16 | 6.2 s |
+| Laya's triage preset, 5 questions, one joint read | 329 | 32 | 15.6-16.0 s |
+| a JevBench hard-tier policy (one Choice) | 3 963 | 16 | 240 s |
+
+Model load is under a second (quantized weights are mmap views); the first read pays for paging them in.
+Time is dominated by the prompt forward and grows roughly linearly with prompt length (~50-60 ms per
+token here); ggml_cpu has no prompt-KV cache, so nothing is reused across requests.
+
+Q2_K is not usable for answers: `DiffusionDecisionBench probe` shows the answer slots put almost no
+probability on any allowed label (label mass < 1 %), even the fixed template positions are not
+reproduced, and plain generation of "What is the capital of France?" gives "Theing of France is to".
+Accuracy needs Q4_K_M or better (and a GPU for useful latency).
 
 ## Using it
 

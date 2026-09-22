@@ -36,6 +36,15 @@ $B bench --model $M --backend ggmlcuda --preset triage --text "…" --iterations
 One untimed warm-up, then `N` timed runs of the same request, the median, and milliseconds per question -
 Laya's `bench`. Use `--isolation independent` to see what one read per question costs.
 
+## Probe
+
+```bash
+$B probe --model $M --preset triage --text "…" --top 5
+```
+
+The model's top tokens at every position of the joint read's canvas, with the answer slots starred - the
+first thing to look at when `label_mass` in the diagnostics is low.
+
 ## JevBench
 
 ```bash
