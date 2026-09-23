@@ -333,6 +333,7 @@ builder.Services.AddSingleton<WebUiAdapter>();
 builder.Services.AddSingleton<OllamaAdapter>();
 builder.Services.AddSingleton<OpenAIChatAdapter>();
 builder.Services.AddSingleton<DiffusionReadAdapter>();
+builder.Services.AddSingleton<DecisionRequestAdapter>();
 // Responses API store: use Redis when TS_RESPONSES_STORE_REDIS_URL is set,
 // otherwise fall back to the bounded in-memory cache.
 string? responsesRedisUrl = Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")?.Trim();

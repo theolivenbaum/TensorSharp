@@ -798,7 +798,11 @@ namespace TensorSharp.Runtime
                     // Gemma's generation boundary is part of its published template:
                     // preserve its newline and any channel prefix exactly. Adding an
                     // empty thought block can make E4B continue unmarked reasoning.
-                    if (architecture != "gemma4" || !addGenerationPrompt)
+                    // DiffusionGemma ships the same template family; trimming its
+                    // "<|turn>model\n" boundary to "<|turn>model" made every prompt
+                    // differ from what the published template (and vLLM) produce.
+                    bool gemmaBoundary = architecture is "gemma4" or "diffusion-gemma" or "diffusion_gemma";
+                    if (!gemmaBoundary || !addGenerationPrompt)
                         result = result.TrimEnd();
                     if (result.Length > 0)
                     {

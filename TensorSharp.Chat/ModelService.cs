@@ -436,6 +436,21 @@ namespace TensorSharp.Server
             return _generation.DiffusionReadAsync(session, history, options, seed, cancellationToken);
         }
 
+        /// <summary>A structured read over already-tokenized prompt ids, with no truncation. See
+        /// <see cref="ChatGenerationPipeline.DiffusionReadTokensAsync"/>.</summary>
+        /// <exception cref="InvalidOperationException">The loaded model is not a diffusion model.</exception>
+        public virtual System.Threading.Tasks.Task<DiffusionReadResult> DiffusionReadTokensAsync(
+            int[] promptTokens,
+            DiffusionReadOptions options,
+            int seed = 0,
+            CancellationToken cancellationToken = default)
+        {
+            if (!IsDiffusionModel)
+                throw new InvalidOperationException(
+                    "Structured reads need a block-diffusion model; the loaded model generates autoregressively.");
+            return _generation.DiffusionReadTokensAsync(promptTokens, options, seed, cancellationToken);
+        }
+
         /// <summary>
         /// Stream generate tokens. Must be called within the InferenceQueue to prevent concurrent access.
         /// Intended for one-shot completions and does not update session history.

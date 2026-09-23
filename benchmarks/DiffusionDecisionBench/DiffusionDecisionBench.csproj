@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <Description>Typed DiffusionGemma decisions (djev's structured read) from the command line: predict, time a question set, and replay JevBench's public decisions into a scored receipt.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\TensorSharp.Structured\TensorSharp.Structured.csproj" />
+    <ProjectReference Include="..\..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
+    <ProjectReference Include="..\..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+  </ItemGroup>
+  <!-- The ggml native library is built by TensorSharp.GGML.Native's CMake build and copied only into
+       TensorSharp.Backends.GGML's own output, so a host has to copy it itself (as InferenceWeb.Tests does). -->
+  <PropertyGroup>
+    <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBuildDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+    <GgmlNativeName Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeName>
+    <GgmlNativeName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeName>
+    <GgmlNativeName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeName>
+  </PropertyGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeName)' != ''">
+    <ItemGroup>
+      <GgmlNative Include="$(GgmlNativeBuildDir)/$(GgmlNativeName)" Condition="Exists('$(GgmlNativeBuildDir)/$(GgmlNativeName)')" />
+      <GgmlNative Include="$(GgmlNativeBuildDir)/Release/$(GgmlNativeName)" Condition="Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeName)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GgmlNative)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>
